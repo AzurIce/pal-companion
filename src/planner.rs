@@ -11,7 +11,7 @@
 
 use crate::breeding::{BreedOutcome, BreedingDB};
 use serde::{Deserialize, Serialize};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Gender {
@@ -77,6 +77,21 @@ pub struct Plan {
     pub total_breedings: u32,
     pub generations: u32,
     pub used_owned: Vec<u64>,
+    /// 树中各配种物种的可选亲本组合（按 (cost, depth, 覆盖) 排序），
+    /// 供 UI 在节点上切换。键为物种 internal_name。
+    pub alternatives: HashMap<String, Vec<Alternative>>,
+}
+
+/// 某物种的一个可选亲本组合
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alternative {
+    /// 无序亲本对（字典序）
+    pub parents: (String, String),
+    pub kind: BreedKind,
+    pub cost: u32,
+    pub depth: u32,
+    /// 该组合血统覆盖的期望被动数
+    pub covered: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +152,8 @@ struct Planner<'a> {
     owned: &'a [OwnedPal],
     /// 期望被动（已去重，保序）
     desired: &'a [String],
+    /// 用户钉选的亲本对：物种 internal_name → 无序亲本对（字典序）
+    pins: &'a HashMap<String, (String, String)>,
     target: usize,
     /// false = 最少配种次数优先（覆盖作平局决胜）；true = 覆盖优先（次数作次优）
     coverage_first: bool,
@@ -151,6 +168,7 @@ impl<'a> Planner<'a> {
         db: &'a BreedingDB,
         owned: &'a [OwnedPal],
         desired: &'a [String],
+        pins: &'a HashMap<String, (String, String)>,
         target: usize,
         coverage_first: bool,
     ) -> Self {
@@ -158,6 +176,7 @@ impl<'a> Planner<'a> {
             db,
             owned,
             desired,
+            pins,
             target,
             coverage_first,
             entries: vec![[None, None]; db.pals.len()],
@@ -195,9 +214,13 @@ impl<'a> Planner<'a> {
         }
         let male = pals.iter().any(|p| p.gender == Gender::Male);
         let female = pals.iter().any(|p| p.gender == Gender::Female);
+        // 掩码取单只最大值而非并集：一次配种只能用一只个体，
+        // 并集会虚报覆盖（同种两只互补个体的合并由同种配种候选正确处理）
         let mask = pals
             .iter()
-            .fold(0u64, |m, p| m | self.mask_of(&p.passives));
+            .map(|p| self.mask_of(&p.passives))
+            .max_by_key(|m| m.count_ones())
+            .unwrap_or(0);
         Some(Entry {
             cost: 0,
             depth: 0,
@@ -343,10 +366,24 @@ impl<'a> Planner<'a> {
     }
 
     /// 自底向上重建树并分配性别。
-    fn build_node(&self, r: (usize, bool), need: Option<Gender>) -> PlanNode {
+    /// 自底向上重建树并分配性别。钉选在重建阶段局部生效：
+    /// 只替换被钉选节点的亲本对，其余节点保持搜索得出的最优 via。
+    fn build_node(
+        &self,
+        r: (usize, bool),
+        need: Option<Gender>,
+        ancestors: &mut Vec<usize>,
+    ) -> PlanNode {
         let species = self.db.pals[r.0].internal_name.clone();
         let e = self.entry(r);
-        match e.via {
+        let mut via = e.via;
+        if let Some((pa, pb)) = self.pins.get(&species) {
+            let (pa, pb) = (pa.clone(), pb.clone());
+            if let Some(v) = self.resolve_pin(r.0, &pa, &pb, ancestors) {
+                via = Some(v);
+            }
+        }
+        match via {
             None => {
                 let pal = self.pick_owned(r.0, need);
                 PlanNode {
@@ -355,18 +392,99 @@ impl<'a> Planner<'a> {
                     source: PlanSource::Owned { pal_id: pal.id },
                 }
             }
-            Some(via) => {
-                let (ga, gb) = self.assign_genders(via, r.0);
+            Some(v) => {
+                let (ga, gb) = self.assign_genders(v, r.0);
+                ancestors.push(r.0);
+                let p1 = self.build_node(v.a, Some(ga), ancestors);
+                let p2 = self.build_node(v.b, Some(gb), ancestors);
+                ancestors.pop();
                 PlanNode {
                     species,
                     need_gender: need,
                     source: PlanSource::Bred {
-                        kind: via.kind,
-                        p1: Box::new(self.build_node(via.a, Some(ga))),
-                        p2: Box::new(self.build_node(via.b, Some(gb))),
+                        kind: v.kind,
+                        p1: Box::new(p1),
+                        p2: Box::new(p2),
                     },
                 }
             }
+        }
+    }
+
+    /// 把钉选的亲本对解析为 Via：要求产出正确、双亲可用、性别可行、不成环。
+    /// 不满足则返回 None（视为未钉选，回退到最优 via）。
+    fn resolve_pin(
+        &self,
+        species: usize,
+        pa: &str,
+        pb: &str,
+        ancestors: &[usize],
+    ) -> Option<Via> {
+        if ancestors.contains(&species) {
+            return None;
+        }
+        // 同种配种：仅当前物种、已持有雌雄各一；双亲都是已持有叶子
+        if pa == pb {
+            if pa != self.db.pals[species].internal_name {
+                return None;
+            }
+            let e = self.entries[species][0].as_ref()?;
+            if e.male && e.female {
+                return Some(Via {
+                    a: (species, false),
+                    b: (species, false),
+                    kind: BreedKind::Formula,
+                });
+            }
+            return None;
+        }
+        let ia = self.db.index_of(pa)?;
+        let ib = self.db.index_of(pb)?;
+        if ia == ib || ia == species || ib == species {
+            return None;
+        }
+        if ancestors.contains(&ia) || ancestors.contains(&ib) {
+            return None;
+        }
+        let (ea, a_bred) = entry_with_kind(&self.entries[ia])?;
+        let (eb, b_bred) = entry_with_kind(&self.entries[ib])?;
+        if !(ea.male || eb.male) || !(ea.female || eb.female) {
+            return None;
+        }
+        match self.db.breed(pa, pb) {
+            Some(BreedOutcome::Normal(c)) if c == species => {
+                let kind = if self.db.is_unique_pair(pa, pb) {
+                    BreedKind::Unique
+                } else {
+                    BreedKind::Formula
+                };
+                Some(Via {
+                    a: (ia, a_bred),
+                    b: (ib, b_bred),
+                    kind,
+                })
+            }
+            Some(BreedOutcome::GenderDependent {
+                if_p1_female,
+                if_p2_female,
+            }) => {
+                if if_p1_female == species && ea.female {
+                    Some(Via {
+                        a: (ia, a_bred),
+                        b: (ib, b_bred),
+                        kind: BreedKind::GenderUnique,
+                    })
+                } else if if_p2_female == species && eb.female {
+                    Some(Via {
+                        a: (ia, a_bred),
+                        b: (ib, b_bred),
+                        kind: BreedKind::GenderUnique,
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -442,11 +560,140 @@ fn collect_stats(root: &PlanNode, breedings: &mut u32, used: &mut Vec<u64>) -> u
     }
 }
 
+/// 取物种的可用条目（优先配种条目，其次已持有），并标注来源。
+fn entry_with_kind(slots: &[Option<Entry>; 2]) -> Option<(&Entry, bool)> {
+    match (&slots[1], &slots[0]) {
+        (Some(bred), _) => Some((bred, true)),
+        (None, Some(owned)) => Some((owned, false)),
+        _ => None,
+    }
+}
+
 impl Planner<'_> {
+    /// 枚举路径树中各配种物种的可选亲本组合（基于已 finalize 的条目）。
+    /// 必须在 into_plan 之前调用（self 尚未消耗且 run 已完成）。
+    fn collect_alternatives(&self, target: usize) -> HashMap<String, Vec<Alternative>> {
+        // 收集树中出现的配种物种
+        let mut tree_species: HashSet<usize> = HashSet::new();
+        let mut stack = vec![target];
+        while let Some(s) = stack.pop() {
+            if let Some(Some(e)) = self.entries.get(s).map(|e| &e[1]) {
+                if tree_species.insert(s) {
+                    if let Some(via) = e.via {
+                        stack.push(via.a.0);
+                        stack.push(via.b.0);
+                    }
+                }
+            }
+        }
+        let mut out = HashMap::new();
+        for &s in &tree_species {
+            let name = self.db.pals[s].internal_name.clone();
+            let mut alts = Vec::new();
+            // 同种配种（合并被动）：已持有该物种且雌雄兼备时也是合法方案
+            if let Some(e) = &self.entries[s][0] {
+                if e.male && e.female {
+                    let males: Vec<&OwnedPal> = self
+                        .owned
+                        .iter()
+                        .filter(|p| p.species == name && p.gender == Gender::Male)
+                        .collect();
+                    let females: Vec<&OwnedPal> = self
+                        .owned
+                        .iter()
+                        .filter(|p| p.species == name && p.gender == Gender::Female)
+                        .collect();
+                    let mut best_mask = 0u64;
+                    for m in &males {
+                        for f in &females {
+                            let mask = self.mask_of(&m.passives) | self.mask_of(&f.passives);
+                            if mask.count_ones() > best_mask.count_ones() {
+                                best_mask = mask;
+                            }
+                        }
+                    }
+                    alts.push(Alternative {
+                        parents: (name.clone(), name.clone()),
+                        kind: BreedKind::Formula,
+                        cost: 1,
+                        depth: 1,
+                        covered: best_mask.count_ones(),
+                    });
+                }
+            }
+            for (a, b, _outcome) in self.db.parents_of(&name) {
+                if a == b {
+                    continue;
+                }
+                // 跳过以该物种自身为亲本的自指组合（对规划展示无意义）
+                if a == s || b == s {
+                    continue;
+                }
+                // 双亲可用性：优先配种条目，否则已持有条目
+                let (Some(ea), Some(eb)) = (
+                    self.entries[a][1].as_ref().or(self.entries[a][0].as_ref()),
+                    self.entries[b][1].as_ref().or(self.entries[b][0].as_ref()),
+                ) else {
+                    continue;
+                };
+                // 性别可行性（含性别唯一组合的雌性指定）
+                if !(ea.male || eb.male) || !(ea.female || eb.female) {
+                    continue;
+                }
+                let pa = &self.db.pals[a].internal_name;
+                let pb = &self.db.pals[b].internal_name;
+                let (kind, gender_ok) = match self.db.breed(pa, pb) {
+                    Some(BreedOutcome::Normal(_)) => (
+                        if self.db.is_unique_pair(pa, pb) {
+                            BreedKind::Unique
+                        } else {
+                            BreedKind::Formula
+                        },
+                        true,
+                    ),
+                    Some(BreedOutcome::GenderDependent {
+                        if_p1_female,
+                        if_p2_female,
+                    }) => {
+                        if if_p1_female == s {
+                            (BreedKind::GenderUnique, ea.female)
+                        } else if if_p2_female == s {
+                            (BreedKind::GenderUnique, eb.female)
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => continue,
+                };
+                if !gender_ok {
+                    continue;
+                }
+                alts.push(Alternative {
+                    parents: if pa <= pb {
+                        (pa.clone(), pb.clone())
+                    } else {
+                        (pb.clone(), pa.clone())
+                    },
+                    kind,
+                    cost: ea.cost + eb.cost + 1,
+                    depth: ea.depth.max(eb.depth) + 1,
+                    covered: (ea.passive_mask | eb.passive_mask).count_ones(),
+                });
+            }
+            alts.sort_by_key(|alt| (alt.cost, alt.depth, std::cmp::Reverse(alt.covered)));
+            alts.truncate(12);
+            if !alts.is_empty() {
+                out.insert(name, alts);
+            }
+        }
+        out
+    }
+
     /// 由最终条目重建 Plan（统计配种次数、世代、用到的已持有帕鲁）。
     fn into_plan(self, target: usize, entry: &Entry) -> Plan {
+        let alternatives = self.collect_alternatives(target);
         let root_ref = (target, entry.via.is_some());
-        let root = self.build_node(root_ref, None);
+        let root = self.build_node(root_ref, None, &mut Vec::new());
         let mut breedings = 0;
         let mut used = Vec::new();
         let generations = collect_stats(&root, &mut breedings, &mut used);
@@ -457,6 +704,7 @@ impl Planner<'_> {
             total_breedings: breedings,
             generations,
             used_owned: used,
+            alternatives,
         }
     }
 
@@ -472,21 +720,46 @@ impl Planner<'_> {
             total_breedings: 0,
             generations: 0,
             used_owned: vec![pal.id],
+            alternatives: HashMap::new(),
         }
     }
 }
 
-/// 计算从已持有帕鲁到目标物种的最优配种路径。
-///
-/// 被动语义：已持有目标但单只未覆盖全部期望被动时视为"未达成"，
-/// 转而求配种路径。两级求解：先求"最少配种次数"的路径，若其血统能覆盖
-/// 全部期望被动则直接采用；否则再求"覆盖优先"的路径（可接受更多次数），
-/// 两者取覆盖更好者（平局取次数少者）。覆盖优先为启发式，非严格最优。
+/// 计算从已持有帕鲁到目标物种的最优配种路径（无钉选）。
+#[allow(dead_code)] // 测试使用；生产代码走 plan_with_pins
 pub fn plan(
     db: &BreedingDB,
     owned: &[OwnedPal],
     target: &str,
     desired_passives: &[String],
+) -> Result<Plan, PlanError> {
+    plan_with_pins(db, owned, target, desired_passives, &HashMap::new())
+}
+
+/// 带钉选亲本对（物种 → 无序亲本对）的规划。
+///
+/// 被动语义：已持有目标但单只未覆盖全部期望被动时视为"未达成"，
+/// 转而求配种路径。两级求解：先求"最少配种次数"的路径，若其血统能覆盖
+/// 全部期望被动则直接采用；否则再求"覆盖优先"的路径（可接受更多次数），
+/// 两者取覆盖更好者（平局取次数少者）。覆盖优先为启发式，非严格最优。
+/// 钉选在树重建阶段局部生效：仅替换被钉选节点的亲本对，不影响搜索与其余结构；
+/// 不可行或成环的钉选自动忽略。
+pub fn plan_with_pins(
+    db: &BreedingDB,
+    owned: &[OwnedPal],
+    target: &str,
+    desired_passives: &[String],
+    pins: &HashMap<String, (String, String)>,
+) -> Result<Plan, PlanError> {
+    plan_inner(db, owned, target, desired_passives, pins)
+}
+
+fn plan_inner(
+    db: &BreedingDB,
+    owned: &[OwnedPal],
+    target: &str,
+    desired_passives: &[String],
+    pins: &HashMap<String, (String, String)>,
 ) -> Result<Plan, PlanError> {
     let Some(target_idx) = db.index_of(target) else {
         return Err(PlanError::UnknownSpecies(target.to_string()));
@@ -504,48 +777,190 @@ pub fn plan(
         p.species == target && desired.iter().all(|d| p.passives.contains(d))
     });
     if satisfied {
-        return Ok(Planner::new(db, owned, &desired, target_idx, false).trivial_plan(target_idx));
+        return Ok(Planner::new(db, owned, &desired, pins, target_idx, false).trivial_plan(target_idx));
     }
 
     // A：最少配种次数优先
-    let mut a = Planner::new(db, owned, &desired, target_idx, false);
+    let mut a = Planner::new(db, owned, &desired, pins, target_idx, false);
     let best_a = a.run();
-    let full_coverage = |e: &Entry| e.passive_mask.count_ones() as usize == desired.len();
-    if let Some(e) = &best_a {
-        if full_coverage(e) {
-            let e = e.clone();
-            return Ok(a.into_plan(target_idx, &e));
-        }
-    }
-
-    // B：覆盖优先（A 未全覆盖时）
-    if !desired.is_empty() {
-        let mut b = Planner::new(db, owned, &desired, target_idx, true);
-        if let Some(eb) = b.run() {
-            let better = match &best_a {
-                None => true,
-                Some(ea) => {
-                    (eb.passive_mask.count_ones(), std::cmp::Reverse(eb.cost))
-                        > (ea.passive_mask.count_ones(), std::cmp::Reverse(ea.cost))
-                }
-            };
-            if better {
-                return Ok(b.into_plan(target_idx, &eb));
+    let full_of = |mask: u64| mask.count_ones() as usize == desired.len();
+    let mask_of = |passives: &[String]| -> u64 {
+        desired.iter().enumerate().fold(0u64, |m, (i, d)| {
+            if passives.contains(d) {
+                m | (1 << i)
+            } else {
+                m
             }
+        })
+    };
+
+    // C：同种合并链——把多只已持有同种的被动逐步合并（X×X→X 反复进行）。
+    // 选种取并集最大的异性对，之后贪心并入仍有新增覆盖的个体；
+    // 配种产物性别按均可获得处理，因此链上每步都可行。
+    let same_chain: Option<(Vec<u64>, u64)> = {
+        let inds: Vec<&OwnedPal> = owned
+            .iter()
+            .filter(|p| p.species == target && mask_of(&p.passives) > 0)
+            .collect();
+        if inds.len() < 2 {
+            None
+        } else {
+            let mut seed: Option<(&OwnedPal, &OwnedPal, u64)> = None;
+            for x in &inds {
+                for y in &inds {
+                    if x.id >= y.id || x.gender == y.gender {
+                        continue;
+                    }
+                    let m = mask_of(&x.passives) | mask_of(&y.passives);
+                    if seed.is_none_or(|(_, _, bm)| m.count_ones() > bm.count_ones()) {
+                        seed = Some((x, y, m));
+                    }
+                }
+            }
+            seed.map(|(a, b, m)| {
+                let mut order = vec![a.id, b.id];
+                let mut acc = m;
+                let mut rest: Vec<&OwnedPal> = inds
+                    .iter()
+                    .copied()
+                    .filter(|p| p.id != a.id && p.id != b.id)
+                    .collect();
+                rest.sort_by_key(|p| std::cmp::Reverse(mask_of(&p.passives).count_ones()));
+                for p in rest {
+                    let m = mask_of(&p.passives);
+                    if m | acc != acc {
+                        acc |= m;
+                        order.push(p.id);
+                    }
+                }
+                (order, acc)
+            })
         }
+    };
+
+    // B：覆盖优先（A 未全覆盖时才需要跑）
+    let mut b_planner = None;
+    let mut best_b = None;
+    if !desired.is_empty() && best_a.as_ref().is_none_or(|e| !full_of(e.passive_mask)) {
+        let mut b = Planner::new(db, owned, &desired, pins, target_idx, true);
+        best_b = b.run();
+        b_planner = Some(b);
     }
 
-    if let Some(e) = best_a {
-        return Ok(a.into_plan(target_idx, &e));
+    // 候选统一比较：全覆盖优先 → 覆盖更多 → 总次数更少
+    // key = (!full, Reverse(covered), cost)，取最小
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct CandKey(u8, std::cmp::Reverse<u32>, u32);
+    let key = |full: bool, cov: u32, cost: u32| CandKey(!full as u8, std::cmp::Reverse(cov), cost);
+
+    let mut winner: Option<(CandKey, usize)> = None; // 0=A 1=B 2=C
+    let mut consider = |k: CandKey, which: usize, winner: &mut Option<(CandKey, usize)>| {
+        if winner.as_ref().is_none_or(|(wk, _)| k < *wk) {
+            *winner = Some((k, which));
+        }
+    };
+    if let Some(e) = &best_a {
+        consider(
+            key(full_of(e.passive_mask), e.passive_mask.count_ones(), e.cost),
+            0,
+            &mut winner,
+        );
     }
-    // 没有可行配种路径：已持有（被动不符）则如实展示，否则报告不可达
-    if owned.iter().any(|p| p.species == target) {
-        return Ok(Planner::new(db, owned, &desired, target_idx, false).trivial_plan(target_idx));
+    if let Some(e) = &best_b {
+        consider(
+            key(full_of(e.passive_mask), e.passive_mask.count_ones(), e.cost),
+            1,
+            &mut winner,
+        );
     }
-    Err(PlanError::Unreachable {
-        target: target.to_string(),
-        unique_parents: db.unique_parents_of(target),
-    })
+    if let Some((order, mask)) = &same_chain {
+        let cost = (order.len() - 1) as u32;
+        consider(key(full_of(*mask), mask.count_ones(), cost), 2, &mut winner);
+    }
+
+    match winner.map(|(_, w)| w) {
+        Some(0) => {
+            let e = best_a.unwrap();
+            Ok(a.into_plan(target_idx, &e))
+        }
+        Some(1) => {
+            let e = best_b.unwrap();
+            Ok(b_planner.unwrap().into_plan(target_idx, &e))
+        }
+        Some(2) => {
+            let (order, _) = same_chain.unwrap();
+            let alternatives = a.collect_alternatives(target_idx);
+            Ok(build_same_chain(owned, target, &order, alternatives))
+        }
+        _ => {
+            // 没有可行配种路径：已持有（被动不符）则如实展示，否则报告不可达
+            if owned.iter().any(|p| p.species == target) {
+                return Ok(Planner::new(db, owned, &desired, pins, target_idx, false)
+                    .trivial_plan(target_idx));
+            }
+            Err(PlanError::Unreachable {
+                target: target.to_string(),
+                unique_parents: db.unique_parents_of(target),
+            })
+        }
+    }
+}
+
+/// 把同种合并链（有序的 pal id 列表）构建为配种链树。
+fn build_same_chain(
+    owned: &[OwnedPal],
+    target: &str,
+    order: &[u64],
+    alternatives: HashMap<String, Vec<Alternative>>,
+) -> Plan {
+    let pal = |id: u64| owned.iter().find(|p| p.id == id).expect("chain 中的 id 必然存在");
+    let leaf = |p: &OwnedPal, need: Gender| PlanNode {
+        species: target.to_string(),
+        need_gender: Some(need),
+        source: PlanSource::Owned { pal_id: p.id },
+    };
+    let opposite = |g: Gender| match g {
+        Gender::Male => Gender::Female,
+        Gender::Female => Gender::Male,
+    };
+    let a = pal(order[0]);
+    let b = pal(order[1]);
+    let mut node = PlanNode {
+        species: target.to_string(),
+        need_gender: None,
+        source: PlanSource::Bred {
+            kind: BreedKind::Formula,
+            p1: Box::new(leaf(a, a.gender)),
+            p2: Box::new(leaf(b, b.gender)),
+        },
+    };
+    for &id in &order[2..] {
+        let ind = pal(id);
+        node = PlanNode {
+            species: target.to_string(),
+            need_gender: None,
+            source: PlanSource::Bred {
+                kind: BreedKind::Formula,
+                // 配种产物性别任选 → 取与并入个体相反的性别
+                p1: Box::new(PlanNode {
+                    need_gender: Some(opposite(ind.gender)),
+                    ..node
+                }),
+                p2: Box::new(leaf(ind, ind.gender)),
+            },
+        };
+    }
+    Plan {
+        root: node,
+        total_breedings: (order.len() - 1) as u32,
+        generations: (order.len() - 1) as u32,
+        used_owned: {
+            let mut v = order.to_vec();
+            v.sort_unstable();
+            v
+        },
+        alternatives,
+    }
 }
 
 #[cfg(test)]
@@ -853,5 +1268,121 @@ mod tests {
         let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
         assert_eq!(plan.total_breedings, 2, "应选择多一次配种但覆盖 lucky 的路径");
         assert!(plan.used_owned.contains(&3));
+    }
+
+    /// 钉选：强制使用指定亲本对，即使它不是默认最优；备选枚举应列出全部可行组合。
+    #[test]
+    fn pin_forces_specific_parent_pair() {
+        // 数据：B×C 或 C×D → E（B×D 双雌不可行）；全部 cost 1
+        let db = sample_db();
+        let owned = vec![
+            owned(1, "B", Gender::Female, &[]),
+            owned(2, "C", Gender::Male, &[]),
+            owned(3, "D", Gender::Female, &[]),
+        ];
+        let mut pins = HashMap::new();
+        pins.insert("E".to_string(), ("C".to_string(), "D".to_string()));
+        let plan = plan_with_pins(&db, &owned, "E", &[], &pins).unwrap();
+        assert_eq!(plan.total_breedings, 1);
+        assert!(matches!(
+            child_by_species(&plan.root, "C").source,
+            PlanSource::Owned { pal_id: 2 }
+        ));
+        assert!(matches!(
+            child_by_species(&plan.root, "D").source,
+            PlanSource::Owned { pal_id: 3 }
+        ));
+        let alts = &plan.alternatives["E"];
+        assert_eq!(alts.len(), 2);
+        assert!(
+            alts.iter()
+                .any(|a| a.parents == ("B".to_string(), "C".to_string()))
+        );
+        assert!(
+            alts.iter()
+                .any(|a| a.parents == ("C".to_string(), "D".to_string()))
+        );
+    }
+
+    /// 同种配种：期望被动分散在两只已持有同种身上时，自配优于公式路径。
+    #[test]
+    fn same_species_consolidates_passives() {
+        // A(100)×B(200) → X(150)（公式）；X 已持有雌雄各一，被动互补
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 200, 2, false),
+                pal("X", 150, 3, true),
+            ],
+            vec![],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Male, &[]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "X", Gender::Male, &["lucky"]),
+            owned(4, "X", Gender::Female, &["brave"]),
+        ];
+        let plan = plan(
+            &db,
+            &owned,
+            "X",
+            &["lucky".to_string(), "brave".to_string()],
+        )
+        .unwrap();
+        assert_eq!(plan.total_breedings, 1);
+        let PlanSource::Bred { p1, p2, .. } = &plan.root.source else {
+            panic!();
+        };
+        assert_eq!(p1.species, "X");
+        assert_eq!(p2.species, "X");
+        assert!(plan.used_owned.contains(&3) && plan.used_owned.contains(&4));
+        // 备选列表应包含同种组合
+        assert!(
+            plan.alternatives["X"]
+                .iter()
+                .any(|a| a.parents.0 == "X" && a.parents.1 == "X")
+        );
+    }
+
+    /// 钉选失效（该组合不产出目标）→ 自动忽略，按最优处理。
+    #[test]
+    fn stale_pin_is_ignored() {
+        let db = sample_db();
+        let owned = vec![
+            owned(1, "B", Gender::Female, &[]),
+            owned(2, "C", Gender::Male, &[]),
+        ];
+        let mut pins = HashMap::new();
+        // A×B 产出 C 而不是 E，该钉选不可行 → 忽略后正常规划
+        pins.insert("E".to_string(), ("A".to_string(), "B".to_string()));
+        let plan = plan_with_pins(&db, &owned, "E", &[], &pins).unwrap();
+        assert_eq!(plan.total_breedings, 1);
+    }
+
+    /// 同种合并链：三只各带一个期望被动的同种 → 两次自配收满。
+    #[test]
+    fn same_species_chain_merges_three_pals() {
+        let db = BreedingDB::new(vec![pal("X", 150, 1, true)], vec![]);
+        let owned = vec![
+            owned(1, "X", Gender::Male, &["lucky"]),
+            owned(2, "X", Gender::Female, &["brave"]),
+            owned(3, "X", Gender::Male, &["swift"]),
+        ];
+        let plan = plan(
+            &db,
+            &owned,
+            "X",
+            &["lucky".to_string(), "brave".to_string(), "swift".to_string()],
+        )
+        .unwrap();
+        assert_eq!(plan.total_breedings, 2);
+        assert_eq!(plan.generations, 2);
+        assert_eq!(plan.used_owned, vec![1, 2, 3]);
+        // 链末端（根的亲本一）应为配种节点
+        let PlanSource::Bred { p1, p2, .. } = &plan.root.source else {
+            panic!();
+        };
+        assert!(matches!(p1.source, PlanSource::Bred { .. }));
+        assert!(matches!(p2.source, PlanSource::Owned { .. }));
     }
 }

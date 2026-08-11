@@ -23,6 +23,7 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     "Clipboard",
     "HtmlTextAreaElement",
+    "console",
 ] }
 # 仅 gen_data 工具使用（WASM 构建不引入，避免 getrandom/js 问题）
 ureq = { version = "3", optional = true }

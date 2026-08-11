@@ -111,7 +111,7 @@ impl BreedingDB {
     pub fn breed(&self, p1: &str, p2: &str) -> Option<BreedOutcome> {
         let a = self.pal(p1)?;
         let b = self.pal(p2)?;
-        Some(self.breed_inner(a, b))
+        self.breed_inner(a, b)
     }
 
     /// 该无序配对是否为唯一组合（非性别规则）。供 planner 标记边类型。
@@ -127,10 +127,10 @@ impl BreedingDB {
         let a = self.pal(p1)?;
         let b = self.pal(p2)?;
         match self.breed_inner(a, b) {
-            BreedOutcome::GenderDependent {
+            Some(BreedOutcome::GenderDependent {
                 if_p1_female,
                 if_p2_female,
-            } => Some((if_p1_female, if_p2_female)),
+            }) => Some((if_p1_female, if_p2_female)),
             _ => None,
         }
     }
@@ -144,7 +144,7 @@ impl BreedingDB {
             .collect()
     }
 
-    fn breed_inner(&self, a: &Pal, b: &Pal) -> BreedOutcome {
+    fn breed_inner(&self, a: &Pal, b: &Pal) -> Option<BreedOutcome> {
         // 1. 唯一组合
         let (lo, hi) = ordered_pair(&a.internal_name, &b.internal_name);
         let combos: Vec<&UniqueCombo> = self
@@ -155,7 +155,7 @@ impl BreedingDB {
         match combos.len() {
             0 => {}
             1 if combos[0].female_parent.is_none() => {
-                return BreedOutcome::Normal(self.by_name[&combos[0].child]);
+                return Some(BreedOutcome::Normal(self.by_name[&combos[0].child]));
             }
             _ => {
                 // 性别相关组合：两条记录，分别标注雌性亲本
@@ -170,23 +170,27 @@ impl BreedingDB {
                     }
                 }
                 if let (Some(x), Some(y)) = (if_a_female, if_b_female) {
-                    return BreedOutcome::GenderDependent {
+                    return Some(BreedOutcome::GenderDependent {
                         if_p1_female: x,
                         if_p2_female: y,
-                    };
+                    });
                 }
                 // 数据异常时退化为第一条记录
-                return BreedOutcome::Normal(self.by_name[&combos[0].child]);
+                return Some(BreedOutcome::Normal(self.by_name[&combos[0].child]));
             }
         }
 
         // 2. 同种必出同种
         if a.internal_name == b.internal_name {
-            return BreedOutcome::Normal(self.by_name[&a.internal_name]);
+            return Some(BreedOutcome::Normal(self.by_name[&a.internal_name]));
         }
 
         // 3. 公式
-        BreedOutcome::Normal(formula_child(&self.pals, &self.eligible, a, b))
+        if self.eligible.is_empty() {
+            // 无公式可产出物种（仅见于合成测试数据；真实数据不会为空）
+            return None;
+        }
+        Some(BreedOutcome::Normal(formula_child(&self.pals, &self.eligible, a, b)))
     }
 
     /// 反向查询：产出指定子代（internal_name）的全部无序亲本组合。
@@ -199,7 +203,9 @@ impl BreedingDB {
         let mut out = Vec::new();
         for i in 0..n {
             for j in i..n {
-                let outcome = self.breed_inner(&self.pals[i], &self.pals[j]);
+                let Some(outcome) = self.breed_inner(&self.pals[i], &self.pals[j]) else {
+                    continue;
+                };
                 let hit = match outcome {
                     BreedOutcome::Normal(c) => c == child_idx,
                     BreedOutcome::GenderDependent {

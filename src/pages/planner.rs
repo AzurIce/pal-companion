@@ -2,7 +2,10 @@
 
 use crate::graph::layout::{GraphData, layout_plan};
 use crate::pages::calculator::pal_options;
-use crate::planner::{BreedKind, Gender, Plan, PlanError, PlanNode, PlanSource, TargetGoal, plan};
+use crate::planner::{
+    Alternative, BreedKind, Gender, Plan, PlanError, PlanNode, PlanSource, TargetGoal,
+    plan_with_pins,
+};
 use crate::sidebar::passive_badge_kind;
 use crate::ui::{Badge, BtnVariant, Button, ComboOption, Combobox, Dialog};
 use crate::{OwnedStore, PlannerSideState, TargetsStore, db, icon_url, passive_by_internal, passives};
@@ -22,12 +25,23 @@ pub fn PlannerPage() -> Element {
     let animate = use_signal(|| false);
     let hovered = use_signal(|| None::<String>);
     let shell_el = use_hook(|| Rc::new(RefCell::new(None::<web_sys::Element>)));
+    // 用户钉选的亲本对（物种 → 无序亲本对），localStorage 持久化
+    let pins = crate::storage::use_persistent(
+        "pal-companion:pins",
+        std::collections::HashMap::<String, (String, String)>::new,
+    );
 
-    // 选中目标 → 自动计算路径（持有列表或目标变更都会触发重算）
+    // 选中目标 → 自动计算路径（持有列表、目标或钉选变更都会触发重算）
     let result = use_memo(move || {
         let id = (*selected.read())?;
         let goal = targets.goals.read().iter().find(|g| g.id == id).cloned()?;
-        Some(plan(db(), &store.pals.read(), &goal.species, &goal.desired_passives))
+        Some(plan_with_pins(
+            db(),
+            &store.pals.read(),
+            &goal.species,
+            &goal.desired_passives,
+            &pins.read(),
+        ))
     });
 
     let graph = use_memo(move || {
@@ -124,6 +138,13 @@ pub fn PlannerPage() -> Element {
                 chain: chain.read().clone(),
                 shell_el: shell_el.clone(),
                 empty: empty_hint,
+                alternatives: result
+                    .read()
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map(|p| Rc::new(p.alternatives.clone()))
+                    .unwrap_or_default(),
+                pins,
                 desired: {
                     let id = *selected.read();
                     id.and_then(|id| {
@@ -137,7 +158,7 @@ pub fn PlannerPage() -> Element {
                     .unwrap_or_default()
                 },
             }
-            TargetSidebar { selected, result, graph }
+            TargetSidebar { selected, result, graph, pins }
         }
     }
 }
@@ -148,6 +169,7 @@ fn TargetSidebar(
     selected: Signal<Option<u64>>,
     result: Memo<Option<Result<Plan, PlanError>>>,
     graph: Memo<Option<GraphData>>,
+    pins: Signal<HashMap<String, (String, String)>>,
 ) -> Element {
     let targets = use_context::<TargetsStore>();
     let side = use_context::<PlannerSideState>();
@@ -310,6 +332,16 @@ fn TargetSidebar(
                     }
                     _ => rsx! {},
                 }
+
+                if !pins.read().is_empty() {
+                    Button {
+                        variant: BtnVariant::Ghost,
+                        sm: true,
+                        class: "side-reset",
+                        onclick: move |_| pins.set(HashMap::new()),
+                        "重置全部亲本方案"
+                    }
+                }
             }
         }
 
@@ -458,6 +490,22 @@ fn TargetFormDialog(
     }
 }
 
+/// 应用亲本组合选择：显式钉选选中项；解除钉选走 remove_pin。
+fn apply_alt_choice(
+    mut pins: Signal<HashMap<String, (String, String)>>,
+    species: &str,
+    alts: &[Alternative],
+    idx: usize,
+) {
+    let mut map = pins.write();
+    map.insert(species.to_string(), alts[idx].parents.clone());
+}
+
+/// 解除某物种的钉选，恢复自动最优。
+fn remove_pin(mut pins: Signal<HashMap<String, (String, String)>>, species: &str) {
+    pins.write().remove(species);
+}
+
 /// 短暂开启视口过渡动画（约 400ms 后关闭，避免影响拖拽手感）。
 fn flash_animate(mut animate: Signal<bool>) {
     animate.set(true);
@@ -482,12 +530,19 @@ fn PlanGraph(
     empty: Element,
     /// 当前目标的期望被动（用于目标节点约束展示与可继承排序）
     desired: Vec<String>,
+    /// 各物种可选亲本组合（来自 plan.alternatives）
+    alternatives: Rc<HashMap<String, Vec<Alternative>>>,
+    /// 用户钉选的亲本对（持久化 signal）
+    mut pins: Signal<HashMap<String, (String, String)>>,
 ) -> Element {
     let side = use_context::<PlannerSideState>();
     let store = use_context::<OwnedStore>();
     let mut side_open = side.open;
     // 平移拖拽期间抑制 hover 更新（无关渲染会用旧 signal 值重写 style 造成瞬跳）
     let mut panning = use_signal(|| false);
+    // 亲本组合完整列表弹窗：(物种, 备选列表, 当前索引)
+    let mut alt_dialog_open = use_signal(|| false);
+    let mut alt_dialog_data = use_signal(|| None::<(String, Vec<Alternative>, usize)>);
     let (nodes, base_edges, info, root_id) = match graph {
         Some(g) => (g.nodes, g.edges, g.info, g.root_id),
         None => (Vec::new(), Vec::new(), HashMap::new(), String::new()),
@@ -565,6 +620,7 @@ fn PlanGraph(
     let chain_for_render = chain.clone();
     let lineage_for_render = lineage.clone();
     let desired_for_render = desired.clone();
+    let alternatives_for_render = alternatives.clone();
     let render_node = move |id: NodeId| {
         let Some(node) = info_for_render.get(&id.0) else {
             return rsx! {};
@@ -640,6 +696,27 @@ fn PlanGraph(
             .collect::<Vec<_>>()
             .join("、");
 
+        // 备选亲本组合切换器（配种节点，备选 >1 时显示在入边交汇处）
+        let alt_switch = if let PlanSource::Bred { p1, p2, .. } = &node.source {
+            let mut vp = [p1.species.clone(), p2.species.clone()];
+            vp.sort();
+            let via_pair = (vp[0].clone(), vp[1].clone());
+            alternatives_for_render
+                .get(&node.species)
+                .filter(|alts| alts.len() > 1)
+                .map(|alts| {
+                    let cur = pins
+                        .peek()
+                        .get(&node.species)
+                        .and_then(|p| alts.iter().position(|a| a.parents == *p))
+                        .or_else(|| alts.iter().position(|a| a.parents == via_pair))
+                        .unwrap_or(0);
+                    (alts.clone(), cur)
+                })
+        } else {
+            None
+        };
+
         let id_enter = id.0.clone();
         rsx! {
             div {
@@ -676,6 +753,44 @@ fn PlanGraph(
                             }
                             if overflow > 0 {
                                 span { class: "badge", "+{overflow}" }
+                            }
+                        }
+                    }
+                }
+                if let Some((alts, cur)) = alt_switch {
+                    {
+                        let len = alts.len();
+                        let sp_prev = node.species.clone();
+                        let sp_next = node.species.clone();
+                        let sp_num = node.species.clone();
+                        let alts_prev = alts.clone();
+                        let alts_next = alts.clone();
+                        let alts_num = alts.clone();
+                        rsx! {
+                            div { class: "alt-switch", "data-flow-no-drag": "true", title: "切换亲本组合",
+                                button {
+                                    onclick: move |_| {
+                                        let next = ((cur as i32 - 1 + len as i32) % len as i32) as usize;
+                                        apply_alt_choice(pins, &sp_prev, &alts_prev, next);
+                                    },
+                                    "▲"
+                                }
+                                button {
+                                    class: "alt-num",
+                                    title: "查看全部亲本组合",
+                                    onclick: move |_| {
+                                        alt_dialog_data.set(Some((sp_num.clone(), alts_num.clone(), cur)));
+                                        alt_dialog_open.set(true);
+                                    },
+                                    "{cur + 1}/{len}"
+                                }
+                                button {
+                                    onclick: move |_| {
+                                        let next = (cur + 1) % len;
+                                        apply_alt_choice(pins, &sp_next, &alts_next, next);
+                                    },
+                                    "▼"
+                                }
                             }
                         }
                     }
@@ -736,6 +851,62 @@ fn PlanGraph(
                 on_pan_start: move |_| panning.set(true),
                 on_pan_end: move |_| panning.set(false),
                 empty,
+            }
+
+            // 亲本组合完整列表弹窗
+            if let Some((species, alts, cur)) = alt_dialog_data.read().clone() {
+                {
+                    let sp = db().pal(&species).unwrap();
+                    let title = format!("{} 的亲本组合", sp.name_zh);
+                    let is_pinned = pins.read().contains_key(&species);
+                    rsx! {
+                        Dialog {
+                            open: alt_dialog_open,
+                            title,
+                            description: "选择用于配种路径的亲本组合".to_string(),
+                            div { class: "alt-list",
+                                button {
+                                    class: if is_pinned { "alt-row" } else { "alt-row active" },
+                                    onclick: move |_| {
+                                        remove_pin(pins, &species);
+                                        alt_dialog_open.set(false);
+                                    },
+                                    span { class: "alt-name", "自动（规划器最优）" }
+                                }
+                                for (i, alt) in alts.iter().enumerate() {
+                                    {
+                                        let pa = db().pal(&alt.parents.0).unwrap();
+                                        let pb = db().pal(&alt.parents.1).unwrap();
+                                        let kind_label = match alt.kind {
+                                            BreedKind::Formula => "公式",
+                                            BreedKind::Unique => "唯一组合",
+                                            BreedKind::GenderUnique => "性别组合",
+                                        };
+                                        let pair = alt.parents.clone();
+                                        let species_for_click = species.clone();
+                                        let alts_for_click = alts.clone();
+                                        rsx! {
+                                            button {
+                                                key: "{pair.0}+{pair.1}",
+                                                class: if is_pinned && i == cur { "alt-row active" } else { "alt-row" },
+                                                onclick: move |_| {
+                                                    apply_alt_choice(pins, &species_for_click, &alts_for_click, i);
+                                                    alt_dialog_open.set(false);
+                                                },
+                                                img { src: icon_url(&pair.0), alt: "" }
+                                                span { class: "alt-name", "{pa.name_zh}" }
+                                                span { class: "pair-plus", "+" }
+                                                img { src: icon_url(&pair.1), alt: "" }
+                                                span { class: "alt-name", "{pb.name_zh}" }
+                                                span { class: "alt-meta", "{kind_label} · 总次数 {alt.cost}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

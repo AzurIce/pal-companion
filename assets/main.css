@@ -213,6 +213,90 @@ footer.attribution { flex: none; }
     font-size: 11px;
 }
 
+/* 备选亲本组合切换器（节点入边交汇处，纵向） */
+
+.alt-switch {
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 6;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1px;
+    padding: 3px 1px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    box-shadow: 0 1px 4px rgb(0 0 0 / 0.12);
+    font-size: 9px;
+    color: var(--muted-foreground);
+    white-space: nowrap;
+}
+
+.alt-switch button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 16px;
+    height: 14px;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 8px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 2px;
+    transition: background-color 0.12s, color 0.12s;
+}
+
+.alt-switch button:hover {
+    background: var(--accent);
+    color: var(--foreground);
+}
+
+.alt-switch .alt-num {
+    font-size: 9.5px;
+    padding: 1px 3px;
+    height: auto;
+}
+
+/* 亲本组合列表弹窗 */
+
+.alt-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.alt-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--background);
+    color: var(--foreground);
+    font-family: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 0.12s, background-color 0.12s;
+}
+
+.alt-row:hover { background: var(--accent); }
+.alt-row.active { border-color: var(--ring); background: var(--accent); }
+
+.alt-row img { width: 30px; height: 30px; border-radius: 6px; background: var(--muted); flex: none; }
+.alt-row .pair-plus { color: var(--muted-foreground); }
+.alt-row .alt-meta { margin-left: auto; font-size: 11px; color: var(--muted-foreground); flex: none; }
+
 /* 目标列表项（右侧栏，复用 owned-item 基础样式） */
 
 .target-item { position: relative; }
