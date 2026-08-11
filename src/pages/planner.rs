@@ -151,6 +151,7 @@ fn TargetSidebar(
 ) -> Element {
     let targets = use_context::<TargetsStore>();
     let side = use_context::<PlannerSideState>();
+    let store = use_context::<OwnedStore>();
     let goals = targets.goals;
     let mut dialog_open = use_signal(|| false);
     let mut editing = use_signal(|| None::<TargetGoal>);
@@ -232,6 +233,28 @@ fn TargetSidebar(
                             .as_ref()
                             .map(|g| g.used_owned.len())
                             .unwrap_or(p.used_owned.len());
+                        // 期望被动中未被路径血统覆盖的（只能赌随机继承）
+                        let missing_names: String = {
+                            let goal = current.and_then(|id| {
+                                goals.read().iter().find(|g| g.id == id).cloned()
+                            });
+                            let used_passives: Vec<String> = store
+                                .pals
+                                .read()
+                                .iter()
+                                .filter(|pal| p.used_owned.contains(&pal.id))
+                                .flat_map(|pal| pal.passives.clone())
+                                .collect();
+                            goal.map(|g| g.desired_passives)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|d| !used_passives.contains(d))
+                                .filter_map(|ps| {
+                                    passive_by_internal(&ps).map(|p| p.name_zh.clone())
+                                })
+                                .collect::<Vec<_>>()
+                                .join("、")
+                        };
                         rsx! {
                             div { class: "side-stats",
                                 div { class: "stat",
@@ -245,6 +268,11 @@ fn TargetSidebar(
                                 div { class: "stat",
                                     b { "{used}" }
                                     span { "用到已持有帕鲁" }
+                                }
+                            }
+                            if !missing_names.is_empty() {
+                                p { class: "side-note side-note--warn",
+                                    "注意：{missing_names} 不在路径中任何已持有帕鲁身上，只能靠随机继承碰运气。"
                                 }
                             }
                             p { class: "side-note", "图中相同子树已折叠复用；配种产物的性别按均可获得处理；被动继承为概率机制，路径仅作亲本优选。" }
@@ -603,6 +631,12 @@ fn PlanGraph(
             v.into_iter().map(|ps| (ps, String::new())).collect()
         };
         let overflow = badges.len().saturating_sub(MAX_BADGES);
+        // 悬停显示全部被动（含被行数限制隐藏的）
+        let all_names = badges
+            .iter()
+            .filter_map(|(ps, _)| passive_by_internal(ps).map(|p| p.name_zh.clone()))
+            .collect::<Vec<_>>()
+            .join("、");
 
         let id_enter = id.0.clone();
         rsx! {
@@ -620,7 +654,7 @@ fn PlanGraph(
                         span { "{kind_label}" }
                     }
                     if !badges.is_empty() {
-                        div { class: "node-passives",
+                        div { class: "node-passives", title: "{all_names}",
                             for (ps, extra_cls) in badges.iter().take(MAX_BADGES) {
                                 if let Some(pp) = passive_by_internal(ps) {
                                     if extra_cls.is_empty() {

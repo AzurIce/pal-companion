@@ -67,16 +67,27 @@ body {
 
 /* ---------- 布局骨架 ---------- */
 
+.app-shell {
+    display: flex;
+    flex-direction: column;
+    height: 100dvh;
+}
+
 .layout-row {
     display: flex;
     align-items: stretch;
-    min-height: calc(100vh - 57px);
+    flex: 1;
+    min-height: 0;
 }
 
 .content {
     flex: 1;
     min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
 }
+
+footer.attribution { flex: none; }
 
 /* ---------- 侧边栏 ---------- */
 
@@ -96,9 +107,7 @@ body {
 
 .sidebar-inner {
     width: 304px;
-    height: calc(100vh - 57px);
-    position: sticky;
-    top: 57px;
+    height: 100%;
     display: flex;
     flex-direction: column;
     padding: 16px 14px;
@@ -758,8 +767,9 @@ footer.attribution a { color: inherit; text-decoration: underline; }
     display: flex;
     flex-wrap: wrap;
     gap: 2px;
-    margin-top: 2px;
-    max-height: 40px;
+    margin-top: 3px;
+    /* 精确两行徽章（17px × 2 + 2px 间距），第三行整行隐藏不截半 */
+    max-height: 36px;
     overflow: hidden;
 }
 
@@ -767,6 +777,7 @@ footer.attribution a { color: inherit; text-decoration: underline; }
     height: 17px;
     padding: 0 5px;
     font-size: 10.5px;
+    flex: none;
 }
 
 .badge--missing {
@@ -793,7 +804,7 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 .planner-layout {
     display: flex;
     align-items: stretch;
-    height: calc(100vh - 57px);
+    height: 100%;
 }
 
 .planner-graph {
@@ -854,6 +865,9 @@ footer.attribution a { color: inherit; text-decoration: underline; }
     margin: 0;
     line-height: 1.6;
 }
+
+.side-note--warn { color: hsl(38 92% 32%); }
+[data-theme="dark"] .side-note--warn { color: hsl(45 93% 65%); }
 
 .side-error {
     padding: 14px;

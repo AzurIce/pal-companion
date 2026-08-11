@@ -107,42 +107,44 @@ fn Navbar() -> Element {
     let sidebar = use_context::<SidebarState>();
     let mut open = sidebar.open;
     rsx! {
-        header { class: "navbar",
-            Button {
-                variant: BtnVariant::Ghost,
-                icon: true,
-                class: "sidebar-toggle",
-                onclick: move |_| {
-                    let next = !*open.read();
-                    open.set(next);
-                },
-                svg {
-                    width: "16", height: "16", view_box: "0 0 24 24", fill: "none",
-                    stroke: "currentColor", stroke_width: "2", stroke_linecap: "round",
-                    line { x1: "3", y1: "6", x2: "21", y2: "6" }
-                    line { x1: "3", y1: "12", x2: "21", y2: "12" }
-                    line { x1: "3", y1: "18", x2: "21", y2: "18" }
+        div { class: "app-shell",
+            header { class: "navbar",
+                Button {
+                    variant: BtnVariant::Ghost,
+                    icon: true,
+                    class: "sidebar-toggle",
+                    onclick: move |_| {
+                        let next = !*open.read();
+                        open.set(next);
+                    },
+                    svg {
+                        width: "16", height: "16", view_box: "0 0 24 24", fill: "none",
+                        stroke: "currentColor", stroke_width: "2", stroke_linecap: "round",
+                        line { x1: "3", y1: "6", x2: "21", y2: "6" }
+                        line { x1: "3", y1: "12", x2: "21", y2: "12" }
+                        line { x1: "3", y1: "18", x2: "21", y2: "18" }
+                    }
+                }
+                div { class: "brand",
+                    span { "帕鲁助手" }
+                }
+                nav {
+                    Link { to: Route::Calculator {}, class: "nav-link", active_class: "active", "配种查询" }
+                    Link { to: Route::PlannerPage {}, class: "nav-link", active_class: "active", "路径规划" }
+                }
+                ThemeToggle {}
+            }
+            div { class: "layout-row",
+                OwnedSidebar {}
+                main { class: "content",
+                    Outlet::<Route> {}
                 }
             }
-            div { class: "brand",
-                span { "帕鲁助手" }
+            footer { class: "attribution",
+                "数据来自 "
+                a { href: "https://github.com/tylercamp/palcalc", "palcalc" }
+                " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
             }
-            nav {
-                Link { to: Route::Calculator {}, class: "nav-link", active_class: "active", "配种查询" }
-                Link { to: Route::PlannerPage {}, class: "nav-link", active_class: "active", "路径规划" }
-            }
-            ThemeToggle {}
-        }
-        div { class: "layout-row",
-            OwnedSidebar {}
-            main { class: "content",
-                Outlet::<Route> {}
-            }
-        }
-        footer { class: "attribution",
-            "数据来自 "
-            a { href: "https://github.com/tylercamp/palcalc", "palcalc" }
-            " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
         }
     }
 }

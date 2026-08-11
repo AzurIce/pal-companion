@@ -11,7 +11,6 @@
 
 use crate::breeding::{BreedOutcome, BreedingDB};
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -95,29 +94,52 @@ pub enum PlanError {
 struct Entry {
     cost: u32,
     depth: u32,
-    /// tie-break：血统中已持有个体携带期望被动的累计数
-    passive_score: u32,
+    /// 血统中已持有个体覆盖的期望被动位掩码（bit i = desired[i]）
+    passive_mask: u64,
     male: bool,
     female: bool,
     via: Option<Via>,
 }
 
 /// 配种来源：两个亲本条目（species 索引, 是否为配种条目）。
-/// Ord 派生仅供堆元素占位，不参与语义比较。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Via {
     a: (usize, bool),
     b: (usize, bool),
     kind: BreedKind,
 }
 
-/// 堆元素：Reverse 让最小 (cost, depth, Reverse(score)) 先弹出。
-type Proposal = Reverse<(u32, u32, Reverse<u32>, usize, Via)>;
+/// 堆元素：按 key 最小弹出（最小堆语义由反向 cmp 实现）。
+#[derive(Debug, PartialEq, Eq)]
+struct Proposal {
+    key: [u32; 3],
+    child: usize,
+    cost: u32,
+    depth: u32,
+    mask: u64,
+    via: Via,
+}
+
+impl Ord for Proposal {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.key.cmp(&self.key)
+    }
+}
+
+impl PartialOrd for Proposal {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 struct Planner<'a> {
     db: &'a BreedingDB,
     owned: &'a [OwnedPal],
+    /// 期望被动（已去重，保序）
     desired: &'a [String],
+    target: usize,
+    /// false = 最少配种次数优先（覆盖作平局决胜）；true = 覆盖优先（次数作次优）
+    coverage_first: bool,
     /// 每物种 [已持有条目, 配种条目]（仅已 finalize 的）
     entries: Vec<[Option<Entry>; 2]>,
     /// 已 finalize 的条目引用（species, is_bred）
@@ -125,13 +147,42 @@ struct Planner<'a> {
 }
 
 impl<'a> Planner<'a> {
-    fn new(db: &'a BreedingDB, owned: &'a [OwnedPal], desired: &'a [String]) -> Self {
+    fn new(
+        db: &'a BreedingDB,
+        owned: &'a [OwnedPal],
+        desired: &'a [String],
+        target: usize,
+        coverage_first: bool,
+    ) -> Self {
         Self {
             db,
             owned,
             desired,
+            target,
+            coverage_first,
             entries: vec![[None, None]; db.pals.len()],
             finalized: Vec::new(),
+        }
+    }
+
+    /// 一组被动覆盖期望的位掩码
+    fn mask_of(&self, passives: &[String]) -> u64 {
+        let mut mask = 0u64;
+        for (i, d) in self.desired.iter().enumerate() {
+            if passives.contains(d) {
+                mask |= 1 << i;
+            }
+        }
+        mask
+    }
+
+    /// 排序键：升序更优
+    fn key(&self, cost: u32, depth: u32, mask: u64) -> [u32; 3] {
+        let missing = self.desired.len() as u32 - mask.count_ones();
+        if self.coverage_first {
+            [missing, cost, depth]
+        } else {
+            [cost, depth, missing]
         }
     }
 
@@ -144,15 +195,13 @@ impl<'a> Planner<'a> {
         }
         let male = pals.iter().any(|p| p.gender == Gender::Male);
         let female = pals.iter().any(|p| p.gender == Gender::Female);
-        let score = pals
+        let mask = pals
             .iter()
-            .flat_map(|p| p.passives.iter())
-            .filter(|ps| self.desired.contains(ps))
-            .count() as u32;
+            .fold(0u64, |m, p| m | self.mask_of(&p.passives));
         Some(Entry {
             cost: 0,
             depth: 0,
-            passive_score: score,
+            passive_mask: mask,
             male,
             female,
             via: None,
@@ -184,7 +233,7 @@ impl<'a> Planner<'a> {
         }
         let cost = ea.cost + eb.cost + 1;
         let depth = ea.depth.max(eb.depth) + 1;
-        let score = ea.passive_score + eb.passive_score;
+        let mask = ea.passive_mask | eb.passive_mask;
         match self.db.breed(&a.internal_name, &b.internal_name) {
             Some(BreedOutcome::Normal(child)) => {
                 let kind = if self.db.is_unique_pair(&a.internal_name, &b.internal_name) {
@@ -192,7 +241,7 @@ impl<'a> Planner<'a> {
                 } else {
                     BreedKind::Formula
                 };
-                self.push(heap, child, cost, depth, score, Via { a: ra, b: rb, kind });
+                self.push(heap, child, cost, depth, mask, Via { a: ra, b: rb, kind });
             }
             Some(BreedOutcome::GenderDependent {
                 if_p1_female,
@@ -200,14 +249,14 @@ impl<'a> Planner<'a> {
             }) => {
                 // 子代取决于哪只亲本是雌性；对应亲本条目必须有雌性
                 if ea.female {
-                    self.push(heap, if_p1_female, cost, depth, score, Via {
+                    self.push(heap, if_p1_female, cost, depth, mask, Via {
                         a: ra,
                         b: rb,
                         kind: BreedKind::GenderUnique,
                     });
                 }
                 if eb.female && if_p2_female != if_p1_female {
-                    self.push(heap, if_p2_female, cost, depth, score, Via {
+                    self.push(heap, if_p2_female, cost, depth, mask, Via {
                         a: ra,
                         b: rb,
                         kind: BreedKind::GenderUnique,
@@ -224,23 +273,33 @@ impl<'a> Planner<'a> {
         child: usize,
         cost: u32,
         depth: u32,
-        score: u32,
+        mask: u64,
         via: Via,
     ) {
+        let key = self.key(cost, depth, mask);
         // 已有更优 finalize 条目则不必提议
         if let Some(e) = &self.entries[child][1] {
-            if (e.cost, e.depth, Reverse(e.passive_score)) <= (cost, depth, Reverse(score)) {
+            if self.key(e.cost, e.depth, e.passive_mask) <= key {
                 return;
             }
         }
-        // 已持有（cost 0）的物种不需要配种获得
-        if self.entries[child][0].is_some() {
+        // 已持有（cost 0）的物种不需要配种获得——但目标物种允许：
+        // 已持有却被动不符时，必须能通过配种重新获得目标
+        if self.entries[child][0].is_some() && child != self.target {
             return;
         }
-        heap.push(Reverse((cost, depth, Reverse(score), child, via)));
+        heap.push(Proposal {
+            key,
+            child,
+            cost,
+            depth,
+            mask,
+            via,
+        });
     }
 
-    fn run(&mut self, target: usize) -> Option<Entry> {
+    /// Dijkstra 主循环。返回目标的最优配种条目（已持有情形由调用方处理）。
+    fn run(&mut self) -> Option<Entry> {
         let mut heap = BinaryHeap::new();
         // 初始：所有已持有条目
         for i in 0..self.db.pals.len() {
@@ -256,21 +315,21 @@ impl<'a> Planner<'a> {
                 self.propose_pair(&mut heap, r, other);
             }
         }
-        while let Some(Reverse((cost, depth, Reverse(score), child, via))) = heap.pop() {
-            if self.entries[child][1].is_some() {
+        while let Some(p) = heap.pop() {
+            if self.entries[p.child][1].is_some() {
                 continue; // 已 finalize 更优解
             }
-            let r = (child, true);
-            self.entries[child][1] = Some(Entry {
-                cost,
-                depth,
-                passive_score: score,
+            let r = (p.child, true);
+            self.entries[p.child][1] = Some(Entry {
+                cost: p.cost,
+                depth: p.depth,
+                passive_mask: p.mask,
                 male: true,
                 female: true, // 后代性别假设：雌雄均可获得
-                via: Some(via),
+                via: Some(p.via),
             });
             self.finalized.push(r);
-            if child == target {
+            if p.child == self.target {
                 break; // 目标已最优，提前结束
             }
             let finalized = self.finalized.clone();
@@ -280,11 +339,7 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        // 目标可能由已持有直接满足
-        if let Some(e) = &self.entries[target][0] {
-            return Some(e.clone());
-        }
-        self.entries[target][1].clone()
+        self.entries[self.target][1].clone()
     }
 
     /// 自底向上重建树并分配性别。
@@ -387,7 +442,46 @@ fn collect_stats(root: &PlanNode, breedings: &mut u32, used: &mut Vec<u64>) -> u
     }
 }
 
+impl Planner<'_> {
+    /// 由最终条目重建 Plan（统计配种次数、世代、用到的已持有帕鲁）。
+    fn into_plan(self, target: usize, entry: &Entry) -> Plan {
+        let root_ref = (target, entry.via.is_some());
+        let root = self.build_node(root_ref, None);
+        let mut breedings = 0;
+        let mut used = Vec::new();
+        let generations = collect_stats(&root, &mut breedings, &mut used);
+        used.sort_unstable();
+        used.dedup();
+        Plan {
+            root,
+            total_breedings: breedings,
+            generations,
+            used_owned: used,
+        }
+    }
+
+    /// 已持有目标帕鲁时的平凡结果（0 次配种）。
+    fn trivial_plan(self, target: usize) -> Plan {
+        let pal = self.pick_owned(target, None);
+        Plan {
+            root: PlanNode {
+                species: self.db.pals[target].internal_name.clone(),
+                need_gender: None,
+                source: PlanSource::Owned { pal_id: pal.id },
+            },
+            total_breedings: 0,
+            generations: 0,
+            used_owned: vec![pal.id],
+        }
+    }
+}
+
 /// 计算从已持有帕鲁到目标物种的最优配种路径。
+///
+/// 被动语义：已持有目标但单只未覆盖全部期望被动时视为"未达成"，
+/// 转而求配种路径。两级求解：先求"最少配种次数"的路径，若其血统能覆盖
+/// 全部期望被动则直接采用；否则再求"覆盖优先"的路径（可接受更多次数），
+/// 两者取覆盖更好者（平局取次数少者）。覆盖优先为启发式，非严格最优。
 pub fn plan(
     db: &BreedingDB,
     owned: &[OwnedPal],
@@ -397,25 +491,60 @@ pub fn plan(
     let Some(target_idx) = db.index_of(target) else {
         return Err(PlanError::UnknownSpecies(target.to_string()));
     };
-    let mut planner = Planner::new(db, owned, desired_passives);
-    let Some(entry) = planner.run(target_idx) else {
-        return Err(PlanError::Unreachable {
-            target: target.to_string(),
-            unique_parents: db.unique_parents_of(target),
-        });
-    };
-    let root_ref = (target_idx, entry.via.is_some());
-    let root = planner.build_node(root_ref, None);
-    let mut breedings = 0;
-    let mut used = Vec::new();
-    let generations = collect_stats(&root, &mut breedings, &mut used);
-    used.sort_unstable();
-    used.dedup();
-    Ok(Plan {
-        root,
-        total_breedings: breedings,
-        generations,
-        used_owned: used,
+    // 期望被动去重（保序），掩码位与下标对应
+    let mut desired: Vec<String> = Vec::new();
+    for d in desired_passives {
+        if !desired.contains(d) {
+            desired.push(d.clone());
+        }
+    }
+
+    // 已持有目标且单只覆盖全部期望 → 直接完成（0 次配种）
+    let satisfied = owned.iter().any(|p| {
+        p.species == target && desired.iter().all(|d| p.passives.contains(d))
+    });
+    if satisfied {
+        return Ok(Planner::new(db, owned, &desired, target_idx, false).trivial_plan(target_idx));
+    }
+
+    // A：最少配种次数优先
+    let mut a = Planner::new(db, owned, &desired, target_idx, false);
+    let best_a = a.run();
+    let full_coverage = |e: &Entry| e.passive_mask.count_ones() as usize == desired.len();
+    if let Some(e) = &best_a {
+        if full_coverage(e) {
+            let e = e.clone();
+            return Ok(a.into_plan(target_idx, &e));
+        }
+    }
+
+    // B：覆盖优先（A 未全覆盖时）
+    if !desired.is_empty() {
+        let mut b = Planner::new(db, owned, &desired, target_idx, true);
+        if let Some(eb) = b.run() {
+            let better = match &best_a {
+                None => true,
+                Some(ea) => {
+                    (eb.passive_mask.count_ones(), std::cmp::Reverse(eb.cost))
+                        > (ea.passive_mask.count_ones(), std::cmp::Reverse(ea.cost))
+                }
+            };
+            if better {
+                return Ok(b.into_plan(target_idx, &eb));
+            }
+        }
+    }
+
+    if let Some(e) = best_a {
+        return Ok(a.into_plan(target_idx, &e));
+    }
+    // 没有可行配种路径：已持有（被动不符）则如实展示，否则报告不可达
+    if owned.iter().any(|p| p.species == target) {
+        return Ok(Planner::new(db, owned, &desired, target_idx, false).trivial_plan(target_idx));
+    }
+    Err(PlanError::Unreachable {
+        target: target.to_string(),
+        unique_parents: db.unique_parents_of(target),
     })
 }
 
@@ -668,5 +797,61 @@ mod tests {
             owned(2, "Q", Gender::Male, &[]),
         ];
         assert!(plan(&db, &pair_m, "R1", &[]).is_err());
+    }
+
+    /// 已持有目标但被动不满足期望 → 视为未达成，返回配种路径。
+    #[test]
+    fn owned_target_with_wrong_passives_plans_breeding() {
+        let db = sample_db(); // A(100)×B(200) → C(150)
+        let owned = vec![
+            owned(1, "A", Gender::Male, &[]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "C", Gender::Female, &[]), // 已持有 C 但不带 lucky
+        ];
+        let plan = plan(&db, &owned, "C", &["lucky".to_string()]).unwrap();
+        // 不是平凡结果：应给出 A×B→C 的配种路径
+        assert!(matches!(plan.root.source, PlanSource::Bred { .. }));
+        assert_eq!(plan.total_breedings, 1);
+    }
+
+    /// 已持有目标且单只覆盖全部期望 → 平凡结果（0 次配种）。
+    #[test]
+    fn owned_target_with_all_desired_is_trivial() {
+        let db = sample_db();
+        let owned = vec![owned(3, "C", Gender::Female, &["lucky", "brave"])];
+        let plan = plan(
+            &db,
+            &owned,
+            "C",
+            &["lucky".to_string(), "brave".to_string()],
+        )
+        .unwrap();
+        assert_eq!(plan.total_breedings, 0);
+        assert_eq!(plan.used_owned, vec![3]);
+    }
+
+    /// 覆盖优先：便宜但不带被动的路径应让位于多一步但全覆盖的路径。
+    #[test]
+    fn coverage_first_upgrades_to_longer_path() {
+        // A(100)×B(300) → T(200)（cost 1，无被动）
+        // A×C(199) → M(150)；M×B → T（cost 2，C 携带 lucky → 覆盖）
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 300, 2, false),
+                pal("C", 199, 3, false),
+                pal("M", 150, 4, true),
+                pal("T", 200, 5, true),
+            ],
+            vec![],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Male, &[]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "C", Gender::Female, &["lucky"]),
+        ];
+        let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
+        assert_eq!(plan.total_breedings, 2, "应选择多一次配种但覆盖 lucky 的路径");
+        assert!(plan.used_owned.contains(&3));
     }
 }

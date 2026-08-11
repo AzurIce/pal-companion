@@ -11,8 +11,8 @@ use crate::planner::{BreedKind, Gender, PlanNode, PlanSource};
 use dioxus_flow::{FlowEdge, FlowNode, NodeId, Point, Size};
 use std::collections::{HashMap, HashSet};
 
-pub const NODE_W: f64 = 176.0;
-pub const NODE_H: f64 = 92.0;
+pub const NODE_W: f64 = 200.0;
+pub const NODE_H: f64 = 100.0;
 pub const COL_GAP: f64 = 92.0;
 pub const ROW_GAP: f64 = 30.0;
 const PITCH: f64 = NODE_H + ROW_GAP;
