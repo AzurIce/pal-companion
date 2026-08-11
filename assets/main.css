@@ -794,6 +794,9 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 
 /* ---------- dioxus-flow 边样式 ---------- */
 
+.flow-frame--animate { transition: transform 0.35s ease; }
+.flow-frame--animate .flow-zoom { transition: zoom 0.35s ease; }
+
 .flow-edge path { transition: stroke 0.15s, stroke-opacity 0.15s; }
 .flow-edge--dashed path { stroke-dasharray: 6 5; }
 .flow-edge--dim path { stroke-opacity: 0.12 !important; }
