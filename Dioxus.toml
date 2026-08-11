@@ -3,5 +3,5 @@ name = "pal-companion"
 
 [web.app]
 title = "幻兽帕鲁配种计算器"
-# GitHub Pages 项目页子路径
-base_path = "pal-companion"
+# 注意：base_path 不写在这里，由 CI 在 dx build 时用 --base-path 传入，
+# 避免本地 dx serve 也带上子路径前缀。

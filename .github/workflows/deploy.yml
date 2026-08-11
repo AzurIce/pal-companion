@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Dioxus base path，例如 /pal-companion/ 或 /"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -17,6 +22,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      BASE_URL: ${{ github.event.inputs.base_url || vars.PAL_COMPANION_BASE_URL || format('/{0}/', github.event.repository.name) }}
+      DIST_DIR: target/dx/pal-companion/release/web/public
     steps:
       - uses: actions/checkout@v4
 
@@ -43,12 +51,21 @@ jobs:
         run: cargo test --workspace
 
       - name: Build web bundle
-        run: dx build --platform web --release
+        run: dx build --platform web --release --base-path "${BASE_URL}"
+
+      - name: SPA fallback & bypass Jekyll
+        run: |
+          cp "${DIST_DIR}/index.html" "${DIST_DIR}/404.html"
+          touch "${DIST_DIR}/.nojekyll"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: target/dx/pal-companion/release/web/public
+          path: ${{ env.DIST_DIR }}
+          include-hidden-files: true
 
   deploy:
     needs: build
