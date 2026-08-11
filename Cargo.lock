@@ -696,7 +696,7 @@ dependencies = [
 [[package]]
 name = "dioxus-flow"
 version = "0.1.0"
-source = "git+https://github.com/AzurIce/dioxus-flow#94e33ca49492e2f53416dfc8528e47e81183cce0"
+source = "git+https://github.com/AzurIce/dioxus-flow#102432f742879f9c283aae9197da8a0078b6c432"
 dependencies = [
  "dioxus",
  "wasm-bindgen",

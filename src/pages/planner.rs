@@ -486,6 +486,8 @@ fn PlanGraph(
     let side = use_context::<PlannerSideState>();
     let store = use_context::<OwnedStore>();
     let mut side_open = side.open;
+    // 平移拖拽期间抑制 hover 更新（无关渲染会用旧 signal 值重写 style 造成瞬跳）
+    let mut panning = use_signal(|| false);
     let (nodes, base_edges, info, root_id) = match graph {
         Some(g) => (g.nodes, g.edges, g.info, g.root_id),
         None => (Vec::new(), Vec::new(), HashMap::new(), String::new()),
@@ -642,8 +644,16 @@ fn PlanGraph(
         rsx! {
             div {
                 class: "{class}",
-                onmouseenter: move |_| hovered.set(Some(id_enter.clone())),
-                onmouseleave: move |_| hovered.set(None),
+                onmouseenter: move |_| {
+                    if !*panning.read() {
+                        hovered.set(Some(id_enter.clone()));
+                    }
+                },
+                onmouseleave: move |_| {
+                    if !*panning.read() {
+                        hovered.set(None);
+                    }
+                },
                 img { src: icon_url(&node.species), alt: "{p.name_zh}" }
                 div { class: "node-main",
                     div { class: "name", "{p.name_zh}" }
@@ -723,6 +733,8 @@ fn PlanGraph(
                 on_node_click: |_| {},
                 animate: *animate.read(),
                 edge_color: "var(--edge)",
+                on_pan_start: move |_| panning.set(true),
+                on_pan_end: move |_| panning.set(false),
                 empty,
             }
         }
