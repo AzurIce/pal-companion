@@ -9,13 +9,17 @@ use std::sync::OnceLock;
 pub fn pal_options() -> &'static [ComboOption] {
     static OPTS: OnceLock<Vec<ComboOption>> = OnceLock::new();
     OPTS.get_or_init(|| {
-        db().pals
-            .iter()
+        let mut pals: Vec<_> = db().pals.iter().collect();
+        // 按图鉴编号排序（变体紧随本体）
+        pals.sort_by_key(|p| (p.paldex_no, p.internal_index));
+        pals.iter()
             .map(|p| ComboOption {
                 value: p.internal_name.clone(),
                 label: p.name_zh.clone(),
                 sublabel: Some(format!("#{} {}", p.paldex_no, p.name_en)),
                 icon: Some(icon_url(&p.internal_name)),
+                desc: None,
+                badge: None,
             })
             .collect()
     })

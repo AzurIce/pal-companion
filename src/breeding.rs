@@ -43,6 +43,9 @@ pub struct Passive {
     pub name_en: String,
     /// 稀有度层级：正值为正面（越高越强），负值为负面
     pub rank: i32,
+    /// 效果描述
+    pub desc_zh: String,
+    pub desc_en: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

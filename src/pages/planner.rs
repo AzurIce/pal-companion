@@ -2,7 +2,7 @@
 
 use crate::graph::layout::{GraphData, layout_plan};
 use crate::pages::calculator::pal_options;
-use crate::planner::{BreedKind, Gender, Plan, PlanError, PlanSource, TargetGoal, plan};
+use crate::planner::{BreedKind, Gender, Plan, PlanError, PlanNode, PlanSource, TargetGoal, plan};
 use crate::sidebar::passive_badge_kind;
 use crate::ui::{Badge, BtnVariant, Button, ComboOption, Combobox, Dialog};
 use crate::{OwnedStore, PlannerSideState, TargetsStore, db, icon_url, passive_by_internal, passives};
@@ -124,6 +124,18 @@ pub fn PlannerPage() -> Element {
                 chain: chain.read().clone(),
                 shell_el: shell_el.clone(),
                 empty: empty_hint,
+                desired: {
+                    let id = *selected.read();
+                    id.and_then(|id| {
+                        targets
+                            .goals
+                            .read()
+                            .iter()
+                            .find(|g| g.id == id)
+                            .map(|g| g.desired_passives.clone())
+                    })
+                    .unwrap_or_default()
+                },
             }
             TargetSidebar { selected, result, graph }
         }
@@ -361,6 +373,8 @@ fn TargetFormDialog(
             label: p.name_zh.clone(),
             sublabel: Some(p.name_en.clone()),
             icon: None,
+            desc: Some(p.desc_zh.clone()),
+            badge: Some(crate::sidebar::passive_rarity(p.rank)),
         })
         .collect();
 
@@ -438,8 +452,11 @@ fn PlanGraph(
     chain: HashSet<String>,
     shell_el: Rc<RefCell<Option<web_sys::Element>>>,
     empty: Element,
+    /// 当前目标的期望被动（用于目标节点约束展示与可继承排序）
+    desired: Vec<String>,
 ) -> Element {
     let side = use_context::<PlannerSideState>();
+    let store = use_context::<OwnedStore>();
     let mut side_open = side.open;
     let (nodes, base_edges, info, root_id) = match graph {
         Some(g) => (g.nodes, g.edges, g.info, g.root_id),
@@ -447,6 +464,57 @@ fn PlanGraph(
     };
     let info = Rc::new(info);
     let highlight_active = !chain.is_empty();
+
+    // 每个节点的可继承被动 = 其已持有祖先节点的被动并集
+    let lineage: Rc<HashMap<String, Vec<String>>> = Rc::new({
+        let mut parents: HashMap<String, Vec<String>> = HashMap::new();
+        for e in &base_edges {
+            parents
+                .entry(e.target.0.clone())
+                .or_default()
+                .push(e.source.0.clone());
+        }
+        fn walk(
+            id: &str,
+            info: &HashMap<String, PlanNode>,
+            parents: &HashMap<String, Vec<String>>,
+            store: &OwnedStore,
+            cache: &mut HashMap<String, Vec<String>>,
+        ) -> Vec<String> {
+            if let Some(v) = cache.get(id) {
+                return v.clone();
+            }
+            let v = match info.get(id).map(|n| &n.source) {
+                Some(PlanSource::Owned { pal_id }) => store
+                    .pals
+                    .read()
+                    .iter()
+                    .find(|p| p.id == *pal_id)
+                    .map(|p| p.passives.clone())
+                    .unwrap_or_default(),
+                _ => {
+                    let mut acc: Vec<String> = Vec::new();
+                    if let Some(ps) = parents.get(id) {
+                        for pid in ps {
+                            for x in walk(pid, info, parents, store, cache) {
+                                if !acc.contains(&x) {
+                                    acc.push(x);
+                                }
+                            }
+                        }
+                    }
+                    acc
+                }
+            };
+            cache.insert(id.to_string(), v.clone());
+            v
+        }
+        let mut cache = HashMap::new();
+        info.keys()
+            .map(|id| (id.clone(), walk(id, &info, &parents, &store, &mut cache)))
+            .collect()
+    });
+    let desired = Rc::new(desired);
 
     let edges = base_edges
         .iter()
@@ -465,6 +533,8 @@ fn PlanGraph(
 
     let info_for_render = info.clone();
     let chain_for_render = chain.clone();
+    let lineage_for_render = lineage.clone();
+    let desired_for_render = desired.clone();
     let render_node = move |id: NodeId| {
         let Some(node) = info_for_render.get(&id.0) else {
             return rsx! {};
@@ -502,6 +572,38 @@ fn PlanGraph(
                 BreedKind::GenderUnique => "性别组合",
             },
         };
+
+        // 被动行：已持有=实际被动；目标=约束被动（标覆盖情况）；配种节点=可继承被动
+        const MAX_BADGES: usize = 4;
+        let covered_set = lineage_for_render.get(&id.0).cloned().unwrap_or_default();
+        let badges: Vec<(String, String)> = if is_target {
+            // (internal_name, css class)：未被路径覆盖的用 missing 样式
+            desired_for_render
+                .iter()
+                .map(|ps| {
+                    let cls = if covered_set.contains(ps) {
+                        ""
+                    } else {
+                        " badge--missing"
+                    };
+                    (ps.clone(), cls.to_string())
+                })
+                .collect()
+        } else if let PlanSource::Owned { .. } = &node.source {
+            covered_set.iter().map(|ps| (ps.clone(), String::new())).collect()
+        } else {
+            // 可继承：期望被动排前
+            let mut v = covered_set.clone();
+            v.sort_by_key(|ps| {
+                desired_for_render
+                    .iter()
+                    .position(|d| d == ps)
+                    .unwrap_or(usize::MAX)
+            });
+            v.into_iter().map(|ps| (ps, String::new())).collect()
+        };
+        let overflow = badges.len().saturating_sub(MAX_BADGES);
+
         let id_enter = id.0.clone();
         rsx! {
             div {
@@ -509,13 +611,29 @@ fn PlanGraph(
                 onmouseenter: move |_| hovered.set(Some(id_enter.clone())),
                 onmouseleave: move |_| hovered.set(None),
                 img { src: icon_url(&node.species), alt: "{p.name_zh}" }
-                div {
+                div { class: "node-main",
                     div { class: "name", "{p.name_zh}" }
                     div { class: "sub",
                         if let Some(g) = gender {
                             span { class: "gender-tag {gender_class}", "{g.symbol()}" }
                         }
                         span { "{kind_label}" }
+                    }
+                    if !badges.is_empty() {
+                        div { class: "node-passives",
+                            for (ps, extra_cls) in badges.iter().take(MAX_BADGES) {
+                                if let Some(pp) = passive_by_internal(ps) {
+                                    if extra_cls.is_empty() {
+                                        Badge { kind: passive_badge_kind(pp.rank), "{pp.name_zh}" }
+                                    } else {
+                                        span { class: "badge {extra_cls}", title: "{pp.desc_zh}", "{pp.name_zh}" }
+                                    }
+                                }
+                            }
+                            if overflow > 0 {
+                                span { class: "badge", "+{overflow}" }
+                            }
+                        }
                     }
                 }
             }

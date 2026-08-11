@@ -1,63 +1,90 @@
 //! 我的帕鲁侧边栏：筛选 / 排序 / 添加 / 编辑 / 删除。
 
 use crate::pages::calculator::pal_options;
-use crate::planner::{Gender, OwnedPal};
+use crate::planner::{Gender, OwnedPal, TargetGoal};
 use crate::ui::{
     Badge, BadgeKind, BtnVariant, Button, ComboOption, Combobox, Dialog, Segment, Segmented,
 };
-use crate::{OwnedStore, SidebarState, db, icon_url, passive_by_internal, passives};
+use crate::{OwnedStore, SidebarState, TargetsStore, db, icon_url, passive_by_internal, passives};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsCast;
 
-/// 导入/导出的数据封套
+/// 导入/导出的数据封套（v2：含目标列表；兼容 v1 与裸数组）
 #[derive(Debug, Serialize, Deserialize)]
 struct ExportEnvelope {
     app: String,
     version: u32,
     pals: Vec<OwnedPal>,
+    /// v1 无此字段 → None；None 时导入不动现有目标列表
+    #[serde(default)]
+    targets: Option<Vec<TargetGoal>>,
 }
 
-fn export_json(pals: &[OwnedPal]) -> String {
+fn export_json(pals: &[OwnedPal], targets: &[TargetGoal]) -> String {
     serde_json::to_string_pretty(&ExportEnvelope {
         app: "pal-companion".to_string(),
-        version: 1,
+        version: 2,
         pals: pals.to_vec(),
+        targets: Some(targets.to_vec()),
     })
     .unwrap_or_default()
 }
 
-/// 解析导入文本：支持封套或裸数组；物种必须在数据库中存在，未知被动静默剔除。
-fn parse_import(text: &str) -> Result<Vec<OwnedPal>, String> {
+/// 解析导入文本：支持 v2/v1 封套或裸帕鲁数组。
+/// 返回 (帕鲁, 目标)；目标为 None 表示数据中不含目标列表。
+/// 物种必须在数据库中存在，未知被动静默剔除。
+fn parse_import(text: &str) -> Result<(Vec<OwnedPal>, Option<Vec<TargetGoal>>), String> {
     let text = text.trim();
     if text.is_empty() {
         return Err("内容为空".to_string());
     }
-    let pals: Vec<OwnedPal> = serde_json::from_str::<ExportEnvelope>(text)
-        .map(|e| e.pals)
-        .or_else(|_| serde_json::from_str::<Vec<OwnedPal>>(text))
-        .map_err(|e| format!("JSON 解析失败：{e}"))?;
-    let unknown: Vec<&str> = pals
+    let (pals, targets) = match serde_json::from_str::<ExportEnvelope>(text) {
+        Ok(e) => (e.pals, e.targets),
+        Err(_) => (
+            serde_json::from_str::<Vec<OwnedPal>>(text)
+                .map_err(|e| format!("JSON 解析失败：{e}"))?,
+            None,
+        ),
+    };
+    let mut unknown: Vec<&str> = pals
         .iter()
         .map(|p| p.species.as_str())
         .filter(|s| db().pal(s).is_none())
         .collect();
+    if let Some(ts) = &targets {
+        unknown.extend(
+            ts.iter()
+                .map(|t| t.species.as_str())
+                .filter(|s| db().pal(s).is_none()),
+        );
+    }
     if !unknown.is_empty() {
         return Err(format!(
             "包含无法识别的帕鲁：{}（可能来自不同数据版本）",
             unknown.join("、")
         ));
     }
-    Ok(pals
+    let pals = pals
         .into_iter()
         .map(|mut p| {
-            p.passives
-                .retain(|ps| passive_by_internal(ps).is_some());
+            p.passives.retain(|ps| passive_by_internal(ps).is_some());
             p
         })
-        .collect())
+        .collect();
+    let targets = targets.map(|ts| {
+        ts.into_iter()
+            .map(|mut t| {
+                t.desired_passives
+                    .retain(|ps| passive_by_internal(ps).is_some());
+                t
+            })
+            .collect()
+    });
+    Ok((pals, targets))
 }
 
+/// 复制到剪贴板。返回 false 表示环境不支持（非安全上下文等）。
 fn copy_to_clipboard(text: &str) -> bool {
     let Some(w) = web_sys::window() else { return false };
     if !w.is_secure_context() {
@@ -65,6 +92,16 @@ fn copy_to_clipboard(text: &str) -> bool {
     }
     let _ = w.navigator().clipboard().write_text(text);
     true
+}
+
+/// 被动的稀有度展示（文字 + 配色）
+pub fn passive_rarity(rank: i32) -> (String, BadgeKind) {
+    match rank {
+        r if r < 0 => ("负面".to_string(), BadgeKind::Negative),
+        r if r >= 4 => ("传说".to_string(), BadgeKind::Gold),
+        3 => ("稀有".to_string(), BadgeKind::Violet),
+        _ => ("普通".to_string(), BadgeKind::Default),
+    }
 }
 
 fn passive_options() -> Vec<ComboOption> {
@@ -75,6 +112,8 @@ fn passive_options() -> Vec<ComboOption> {
             label: p.name_zh.clone(),
             sublabel: Some(p.name_en.clone()),
             icon: None,
+            desc: Some(p.desc_zh.clone()),
+            badge: Some(passive_rarity(p.rank)),
         })
         .collect()
 }
@@ -109,11 +148,16 @@ fn matches_query(pal: &OwnedPal, q: &str) -> bool {
 pub fn OwnedSidebar() -> Element {
     let state = use_context::<SidebarState>();
     let store = use_context::<OwnedStore>();
+    let targets = use_context::<TargetsStore>();
     let mut filter = use_signal(String::new);
     let sort = use_signal(|| "dex".to_string());
     let mut dialog_open = use_signal(|| false);
     let mut editing = use_signal(|| None::<OwnedPal>);
-    let mut io_open = use_signal(|| false);
+    let mut import_open = use_signal(|| false);
+    // 剪贴板不可用时的兜底导出（弹窗手动复制）
+    let mut fallback_open = use_signal(|| false);
+    let mut fallback_json = use_signal(String::new);
+    let mut copied = use_signal(|| false);
 
     let q = filter.read().to_lowercase();
     let mut list: Vec<OwnedPal> = store
@@ -148,14 +192,51 @@ pub fn OwnedSidebar() -> Element {
                         sm: true,
                         icon: true,
                         class: "io-btn",
-                        onclick: move |_| io_open.set(true),
+                        // 一键导出：直接复制 JSON（含目标列表）到剪贴板
+                        onclick: move |_| {
+                            let json = export_json(&store.pals.read(), &targets.goals.read());
+                            if copy_to_clipboard(&json) {
+                                copied.set(true);
+                                let cb = wasm_bindgen::closure::Closure::once(move || {
+                                    copied.set(false)
+                                });
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w
+                                        .set_timeout_with_callback_and_timeout_and_arguments_0(
+                                            cb.as_ref().unchecked_ref(),
+                                            1500,
+                                        );
+                                }
+                                cb.forget();
+                            } else {
+                                fallback_json.set(json);
+                                fallback_open.set(true);
+                            }
+                        },
+                        if *copied.read() {
+                            "✓"
+                        } else {
+                            svg {
+                                width: "14", height: "14", view_box: "0 0 24 24", fill: "none",
+                                stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                                path { d: "M12 15V3" }
+                                path { d: "m7 8 5-5 5 5" }
+                                path { d: "M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4" }
+                            }
+                        }
+                    }
+                    Button {
+                        variant: BtnVariant::Ghost,
+                        sm: true,
+                        icon: true,
+                        class: "io-btn",
+                        onclick: move |_| import_open.set(true),
                         svg {
                             width: "14", height: "14", view_box: "0 0 24 24", fill: "none",
                             stroke: "currentColor", stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
                             path { d: "M12 3v12" }
-                            path { d: "m7 8 5-5 5 5" }
-                            path { d: "M12 21V9" }
-                            path { d: "m17 16-5 5-5-5" }
+                            path { d: "m17 10-5 5-5-5" }
+                            path { d: "M5 21h14" }
                         }
                     }
                     Button {
@@ -238,71 +319,84 @@ pub fn OwnedSidebar() -> Element {
         }
 
         PalFormDialog { open: dialog_open, editing: editing.read().clone() }
-        ImportExportDialog { open: io_open }
+        ImportDialog { open: import_open }
+
+        // 剪贴板不可用时的兜底导出弹窗（手动全选复制）
+        Dialog {
+            open: fallback_open,
+            title: "导出".to_string(),
+            description: "当前环境不支持自动复制，请全选以下内容手动复制".to_string(),
+            textarea {
+                class: "input textarea",
+                readonly: true,
+                value: "{fallback_json}",
+                onclick: move |e| {
+                    if let Some(el) = e.data().downcast::<web_sys::HtmlTextAreaElement>() {
+                        el.select();
+                    }
+                },
+            }
+        }
     }
 }
 
-/// 导入 / 导出对话框。
+/// 导入对话框（同时处理帕鲁与目标列表）。
 #[component]
-fn ImportExportDialog(open: Signal<bool>) -> Element {
+fn ImportDialog(open: Signal<bool>) -> Element {
     let store = use_context::<OwnedStore>();
+    let targets = use_context::<TargetsStore>();
     let mut pals = store.pals;
+    let mut goals = targets.goals;
     let mut import_text = use_signal(String::new);
     let import_mode = use_signal(|| "append".to_string());
     let mut message = use_signal(|| None::<(bool, String)>);
-    let mut copy_label = use_signal(|| "复制到剪贴板".to_string());
-
-    let exported = if *open.read() {
-        export_json(&pals.read())
-    } else {
-        String::new()
-    };
-
-    let exported_for_copy = exported.clone();
-    let do_copy = move |_| {
-        if copy_to_clipboard(&exported_for_copy) {
-            copy_label.set("已复制 ✓".to_string());
-            let cb = wasm_bindgen::closure::Closure::once(move || {
-                copy_label.set("复制到剪贴板".to_string())
-            });
-            if let Some(w) = web_sys::window() {
-                let _ = w.set_timeout_with_callback_and_timeout_and_arguments_0(
-                    cb.as_ref().unchecked_ref(),
-                    1500,
-                );
-            }
-            cb.forget();
-        } else {
-            copy_label.set("复制失败，请手动全选复制".to_string());
-        }
-    };
 
     let do_import = move |_| {
         let text = import_text.read().clone();
         match parse_import(&text) {
-            Ok(mut imported) => {
-                let count = imported.len();
-                let mut list = pals.write();
-                if import_mode.read().as_str() == "replace" {
-                    for (i, p) in imported.iter_mut().enumerate() {
-                        p.id = (i + 1) as u64;
-                    }
-                    *list = imported;
-                } else {
-                    let mut next = list.iter().map(|p| p.id).max().unwrap_or(0) + 1;
-                    for mut p in imported {
-                        p.id = next;
-                        next += 1;
-                        list.push(p);
+            Ok((mut new_pals, new_targets)) => {
+                let pal_count = new_pals.len();
+                let replace = import_mode.read().as_str() == "replace";
+                {
+                    let mut list = pals.write();
+                    if replace {
+                        for (i, p) in new_pals.iter_mut().enumerate() {
+                            p.id = (i + 1) as u64;
+                        }
+                        *list = new_pals;
+                    } else {
+                        let mut next = list.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+                        for mut p in new_pals {
+                            p.id = next;
+                            next += 1;
+                            list.push(p);
+                        }
                     }
                 }
-                let mode_label = if import_mode.read().as_str() == "replace" {
-                    "覆盖"
-                } else {
-                    "追加"
+                // 数据里不含目标字段（v1 / 裸数组）时不动现有目标
+                let target_count = new_targets.as_ref().map(|t| t.len());
+                if let Some(mut new_targets) = new_targets {
+                    let mut list = goals.write();
+                    if replace {
+                        for (i, t) in new_targets.iter_mut().enumerate() {
+                            t.id = (i + 1) as u64;
+                        }
+                        *list = new_targets;
+                    } else {
+                        let mut next = list.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                        for mut t in new_targets {
+                            t.id = next;
+                            next += 1;
+                            list.push(t);
+                        }
+                    }
+                }
+                let mode_label = if replace { "覆盖" } else { "追加" };
+                let detail = match target_count {
+                    Some(tc) => format!("{pal_count} 只帕鲁、{tc} 个目标"),
+                    None => format!("{pal_count} 只帕鲁"),
                 };
-                drop(list);
-                message.set(Some((true, format!("已{mode_label}导入 {count} 只帕鲁"))));
+                message.set(Some((true, format!("已{mode_label}导入 {detail}"))));
                 import_text.set(String::new());
             }
             Err(e) => message.set(Some((false, e))),
@@ -312,26 +406,9 @@ fn ImportExportDialog(open: Signal<bool>) -> Element {
     rsx! {
         Dialog {
             open,
-            title: "导入 / 导出".to_string(),
-            description: "在不同设备或部署之间迁移你的帕鲁列表".to_string(),
+            title: "导入".to_string(),
+            description: "粘贴导出的 JSON（包含帕鲁与目标列表）".to_string(),
             div { class: "form-row",
-                label { class: "field-label", "导出（当前列表的 JSON）" }
-                textarea {
-                    class: "input textarea",
-                    readonly: true,
-                    value: "{exported}",
-                    onclick: move |e| {
-                        if let Some(el) = e.data().downcast::<web_sys::HtmlTextAreaElement>() {
-                            el.select();
-                        }
-                    },
-                }
-                div { style: "margin-top: 8px; display: flex; justify-content: flex-end;",
-                    Button { variant: BtnVariant::Outline, sm: true, onclick: do_copy, "{copy_label}" }
-                }
-            }
-            div { class: "form-row",
-                label { class: "field-label", "导入（粘贴 JSON）" }
                 textarea {
                     class: "input textarea",
                     placeholder: "粘贴导出的 JSON…",

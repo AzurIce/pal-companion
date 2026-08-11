@@ -123,6 +123,24 @@ pub struct ComboOption {
     pub sublabel: Option<String>,
     /// 图标 URL
     pub icon: Option<String>,
+    /// 效果描述（选项第二行小字）
+    pub desc: Option<String>,
+    /// 稀有度徽标（文字 + 配色）
+    pub badge: Option<(String, BadgeKind)>,
+}
+
+impl ComboOption {
+    #[allow(dead_code)] // 便捷构造器，备用
+    pub fn simple(value: String, label: String, sublabel: Option<String>, icon: Option<String>) -> Self {
+        Self {
+            value,
+            label,
+            sublabel,
+            icon,
+            desc: None,
+            badge: None,
+        }
+    }
 }
 
 /// 可搜索下拉选择器。直接读写父组件传入的 signal。
@@ -252,9 +270,19 @@ pub fn Combobox(
                                 if let Some(icon) = &o.icon {
                                     img { src: icon.clone(), alt: "" }
                                 }
-                                span { class: "opt-label", "{o.label}" }
-                                if let Some(sub) = &o.sublabel {
-                                    span { class: "opt-sub", "{sub}" }
+                                div { class: "opt-main",
+                                    div { class: "opt-line",
+                                        span { class: "opt-label", "{o.label}" }
+                                        if let Some((text, kind)) = &o.badge {
+                                            Badge { kind: *kind, "{text}" }
+                                        }
+                                        if let Some(sub) = &o.sublabel {
+                                            span { class: "opt-sub", "{sub}" }
+                                        }
+                                    }
+                                    if let Some(desc) = &o.desc {
+                                        div { class: "opt-desc", "{desc}" }
+                                    }
                                 }
                             }
                         }

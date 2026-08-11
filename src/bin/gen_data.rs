@@ -35,6 +35,8 @@ struct RawDb {
 struct RawPassive {
     #[serde(default)]
     localized_names: Option<HashMap<String, String>>,
+    #[serde(default)]
+    localized_descriptions: Option<HashMap<String, String>>,
     internal_name: String,
     rank: i32,
     is_standard_passive_skill: bool,
@@ -146,11 +148,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|m| m.get("zh-Hans"))
                 .cloned()
                 .unwrap_or_else(|| name_en.clone());
+            let desc_en = p
+                .localized_descriptions
+                .as_ref()
+                .and_then(|m| m.get("en"))
+                .cloned()
+                .unwrap_or_default();
+            let desc_zh = p
+                .localized_descriptions
+                .as_ref()
+                .and_then(|m| m.get("zh-Hans"))
+                .cloned()
+                .unwrap_or_else(|| desc_en.clone());
             Passive {
                 internal_name: p.internal_name,
                 name_zh,
                 name_en,
                 rank: p.rank,
+                desc_zh,
+                desc_en,
             }
         })
         .collect();
