@@ -1,0 +1,13 @@
+# crates.io 直连过慢时使用的国内镜像（rsproxy.cn）。
+# 如网络正常可删除本文件，恢复官方源。
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/index"
+
+[net]
+git-fetch-with-cli = true

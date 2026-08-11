@@ -1,0 +1,7 @@
+[application]
+name = "pal-companion"
+
+[web.app]
+title = "幻兽帕鲁配种计算器"
+# GitHub Pages 项目页子路径
+base_path = "pal-companion"

@@ -1,0 +1,36 @@
+[workspace]
+members = ["crates/dioxus-flow"]
+
+[package]
+name = "pal-companion"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+gen-data = ["dep:ureq"]
+
+[dependencies]
+dioxus = { version = "0.7", features = ["web", "router"] }
+dioxus-flow = { path = "crates/dioxus-flow" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gloo-storage = "0.3"
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "Element",
+    "Event",
+    "EventTarget",
+    "MediaQueryList",
+    "Navigator",
+    "Clipboard",
+    "HtmlTextAreaElement",
+] }
+# 仅 gen_data 工具使用（WASM 构建不引入，避免 getrandom/js 问题）
+ureq = { version = "3", optional = true }
+
+[[bin]]
+name = "gen_data"
+path = "src/bin/gen_data.rs"
+required-features = ["gen-data"]
