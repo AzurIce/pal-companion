@@ -190,7 +190,7 @@ footer.attribution { flex: none; }
     flex: none;
 }
 
-/* 头像角标：头领（左上） / 幸运（右上） / 最爱 I·II·III（右下） */
+/* 头像角标：头领/闪光（左上） / 最爱 I·II·III（右上） */
 .owned-avatar { position: relative; flex: none; }
 .owned-avatar img {
     width: 40px;
@@ -199,18 +199,32 @@ footer.attribution { flex: none; }
     background: var(--muted);
     display: block;
 }
-.avatar-badge {
+/* 游戏头领/闪光/最爱图标；提高选择器优先级，避免被头像的 40×40 规则覆盖。 */
+.owned-avatar > img.avatar-badge-img {
     position: absolute;
-    font-size: 10px;
-    line-height: 1.2;
-    border-radius: 999px;
-    padding: 1px 4px;
+    top: -6px;
+    left: -6px;
+    width: 20px;
+    height: 20px;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    object-fit: contain;
     pointer-events: none;
 }
-.avatar-badge--boss, .avatar-badge--lucky { top: -5px; left: -5px; }
-.avatar-badge--boss { background: #7c3aed; color: #fff; box-shadow: 0 0 0 2px var(--card); }
-.avatar-badge--lucky { background: #f59e0b; color: #fff; box-shadow: 0 0 0 2px var(--card); }
-.avatar-badge--fav { top: -5px; right: -5px; background: var(--muted); color: var(--foreground); box-shadow: 0 0 0 2px var(--card); }
+.owned-avatar > img.avatar-badge-img--boss {
+    /* 原游戏资源为 64×64；20×20 与头像中的游戏缩放比例一致。 */
+    image-rendering: auto;
+}
+.owned-avatar > img.avatar-badge-img--fav {
+    left: auto;
+    right: -6px;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    /* PNG 已按游戏 Brush Tint 主色 #FFE121 预着色，保持原始 alpha。 */
+    filter: none;
+}
 .owned-item-nick { color: var(--foreground); }
 .owned-item-nick + .species-sub { margin-left: 0; }
 
@@ -753,6 +767,17 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 .dialog-title { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
 .dialog-desc { font-size: 13px; color: var(--muted-foreground); margin: 0 0 18px; }
 .dialog .form-row { margin-bottom: 14px; }
+.dialog .form-inline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: flex-end;
+    margin-bottom: 14px;
+}
+.dialog .form-inline-item {
+    display: flex;
+    flex-direction: column;
+}
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
 /* ---------- 配种查询页 ---------- */
@@ -1169,7 +1194,7 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 /* 持有列表：头领 / 最爱 标记 */
 .boss-tag { font-size: 11px; color: #b45309; background: #fef3c7; border-radius: var(--radius, 4px); padding: 0 4px; margin-left: 4px; }
 .fav-tag { font-size: 11px; color: #b91c1c; margin-left: 4px; }
-.boss-checkbox { width: 16px; height: 16px; }
+/* boss-checkbox 已由表单内的 3 段「头领/幸运」控件取代，此处不再需要 */
 
 /* 持有列表：昵称后的物种小字 */
 .species-sub { color: var(--muted-foreground); font-size: 12px; margin-left: 4px; }

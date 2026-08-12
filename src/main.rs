@@ -99,7 +99,8 @@ fn App() -> Element {
         open: planner_side_open,
     });
     // 游戏同步：状态 store + WebSocket 客户端（本地 mod 未启动时静默重试）
-    let auto_sync = storage::use_persistent("palcompanion_auto_sync", || false);
+    // 自动同步开关（key 沿用旧名 palcompanion_auto_merge 以保留用户已有状态）
+    let auto_sync = storage::use_persistent("palcompanion_auto_merge", || false);
     use_context_provider(|| sync_client::SyncStore {
         status: Signal::new(sync_client::SyncStatus::Disconnected),
         pending: Signal::new(Vec::new()),
