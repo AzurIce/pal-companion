@@ -607,8 +607,12 @@ local function dumpContainerPals(container, cidx)
     local group = "base"
     if n == 5 then group = "party" elseif n == 960 then group = "box" end
     local pals = {}
-    for i = 0, math.min(n, MAX_DUMP_PALS) - 1 do
-        local okSlot, slot = pcall(function() return container:Get(i) end)
+    -- iterate the GetSlots() array directly (pure Lua, zero per-slot UE4SS
+    -- reflection calls). container:Get(i) ×960 was the pure-virtual crash
+    -- source (GIsRunning==1); slots[i] is a plain array read.
+    local limit = math.min(n, MAX_DUMP_PALS)
+    for i = 1, limit do
+        local okSlot, slot = pcall(function() return slots[i] end)
         if okSlot and isValid(slot) then
             local param = slotParam(slot)
             -- verbose for the first 3 non-empty slots (field-level detail)
@@ -671,65 +675,16 @@ local function dumpAll(reason)
         end
         return false
     end
-    -- PalBox slots beyond the current page are lazily materialized per page.
-    -- Turn every page and collect each page's container AS WE GO (page turns
-    -- reset previously-filled slots, so dump-then-turn loses data). Async:
-    -- one page per frame tick so the game never blocks for the whole sweep.
+    -- collect every container directly. GetSlots() arrays are read with pure
+    -- Lua (no per-slot reflection); if the box array already holds all pal
+    -- slots in memory, NO page turns are needed at all.
+    for _, c in ipairs(containers) do collect(c) end
     local function finish()
         broadcastJson('{"version":1,"source":"palws","event":"' .. reason
             .. '","pals":[' .. table.concat(all, ",") .. "]}")
         print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
     end
-    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
-    local boxUI = nil
-    if okU and type(uis) == "table" then
-        for _, ui in ipairs(uis) do
-            local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
-            if okN and type(n) == "number" and n > 1 then boxUI = ui break end
-        end
-    end
-    if boxUI == nil then
-        for _, c in ipairs(containers) do collect(c) end
-        finish()
-        return
-    end
-    local okMax, maxPage = pcall(function() return boxUI:GetBoxMaxPageNum() end)
-    if not okMax or type(maxPage) ~= "number" or maxPage <= 1 then
-        for _, c in ipairs(containers) do collect(c) end
-        finish()
-        return
-    end
-    local page = 1
-    local step = nil
-    step = function()
-        -- 纯虚函数崩（GIsRunning==1）风险：翻页销毁/重建容器对象。
-        -- 每步检查 UI 存活，销毁或翻页失败即安全中止（保留已收集数据）。
-        if not isValid(boxUI) then
-            print("[Palws] dumpAll abort: box UI gone\n")
-            finish()
-            return
-        end
-        local okPage = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
-        if not okPage then
-            print("[Palws] dumpAll abort: page turn failed\n")
-            finish()
-            return
-        end
-        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-        if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do
-                if isValid(c) then collect(c) end
-            end
-        end
-        page = page + 1
-        if page > maxPage then
-            pcall(function() boxUI:SetPagePalBoxList(0) end)  -- back to page 1
-            finish()
-        else
-            ExecuteWithDelay(12, step)  -- spread across frames (fast: 32p×12ms≈0.4s)
-        end
-    end
-    step()
+    finish()
 end
 
 -- PalBox is paged (30 slots/page, up to 32 pages = 960): slots beyond the
