@@ -712,7 +712,7 @@ local function dumpAll(reason)
             pcall(function() boxUI:SetPagePalBoxList(0) end)  -- back to page 1
             finish()
         else
-            ExecuteWithDelay(40, step)  -- spread across frames
+            ExecuteWithDelay(12, step)  -- spread across frames (fast: 32p×12ms≈0.4s)
         end
     end
     step()
@@ -1213,10 +1213,8 @@ RegisterKeyBind(Key.F3, guarded("F3", function()
 end))
 
 RegisterKeyBind(Key.F4, guarded("F4", function()
-    ExecuteInGameThread(guarded("introspect", function()
-        pcall(introspectFirstPal)
-        pcall(memmapFirstPal)
-    end))
+    -- (was introspect+memmap: AV'd the game at 15:13; disabled)
+    print("[Palws] F4 disabled (introspect/memmap AV'd the game)\n")
 end))
 
 RegisterKeyBind(Key.F5, guarded("F5", function()
