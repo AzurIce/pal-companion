@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Build palws.dll and deploy to the Palworld Workshop-UE4SS mod dir.
+# Run from the workspace root (E:\pal-companion) or crates/palws/:
 #
 #   scripts/build.sh            # release build + deploy
 #   scripts/build.sh --only-lua # skip cargo, just copy main.lua
@@ -13,14 +14,17 @@ set -euo pipefail
 
 GAME_ROOT="/g/SteamLibrary/steamapps/common/Palworld"
 MOD_DIR="$GAME_ROOT/Mods/NativeMods/UE4SS/Mods/Palws"
+# workspace layout: crates/palws/scripts/build.sh -> WS root is two up
+CRATE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+WS_ROOT="$(cd "$CRATE_DIR/../.." && pwd)"
 
 if [ "${1:-}" != "--only-lua" ]; then
-  cargo build --release
+  (cd "$WS_ROOT" && cargo build --release -p palws)
 fi
 
 mkdir -p "$MOD_DIR/Scripts"
-cp target/release/palws.dll "$MOD_DIR/Scripts/palws.dll"
-cp lua/main.lua "$MOD_DIR/Scripts/main.lua"
+cp "$WS_ROOT/target/release/palws.dll" "$MOD_DIR/Scripts/palws.dll"
+cp "$CRATE_DIR/lua/main.lua" "$MOD_DIR/Scripts/main.lua"
 touch "$MOD_DIR/enabled.txt"
 
 echo "deployed -> $MOD_DIR"

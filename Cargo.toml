@@ -3,6 +3,10 @@ name = "pal-companion"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/palws"]
+resolver = "2"
+
 [features]
 gen-data = ["dep:ureq"]
 
@@ -36,3 +40,6 @@ ureq = { version = "3", optional = true }
 name = "gen_data"
 path = "src/bin/gen_data.rs"
 required-features = ["gen-data"]
+
+[profile.release]
+lto = true

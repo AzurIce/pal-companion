@@ -20,10 +20,11 @@ external tools (pal-companion etc.).
 
 1. Subscribe to **UE4SS Experimental (Palworld)** on Steam Workshop, enable it
    in 选项 → Mod 管理, launch once so the loader deploys it.
-2. `scripts/build.sh` deploys `palws.dll` + `main.lua` to
+2. `crates/palws/scripts/build.sh` deploys `palws.dll` + `main.lua` to
    `Palworld\Mods\NativeMods\UE4SS\Mods\Palws\` and touches `enabled.txt`
    (UE4SS's enabled.txt scan picks up the mod even if the loader regenerates
-   `mods.txt`).
+   `mods.txt`). Run it from the workspace root (`scripts/build.sh`) or from
+   `crates/palws/`.
 3. On game start, UE4SS loads Palws; verify in
    `Palworld\Mods\NativeMods\UE4SS\UE4SS.log`.
 
