@@ -107,6 +107,15 @@ impl BreedingDB {
         self.index_of(internal_name).map(|i| &self.pals[i])
     }
 
+    /// 大小写不敏感的查找，命中时返回图鉴的规范 internal_name。
+    /// 游戏内 FName 与图鉴命名可能差在大小写（GhostAnglerFish vs GhostAnglerfish）。
+    pub fn canonical_name_ci(&self, name: &str) -> Option<&str> {
+        self.pals
+            .iter()
+            .find(|p| p.internal_name.eq_ignore_ascii_case(name))
+            .map(|p| p.internal_name.as_str())
+    }
+
     /// 计算一对亲本的子代。p1、p2 为 internal_name。
     pub fn breed(&self, p1: &str, p2: &str) -> Option<BreedOutcome> {
         let a = self.pal(p1)?;

@@ -36,6 +36,41 @@ pub struct OwnedPal {
     pub gender: Gender,
     /// 被动技能 internal_name，最多 4 个
     pub passives: Vec<String>,
+    /// 所在位置（队伍/盒子/据点）；旧存档与手动登记默认盒子
+    #[serde(default)]
+    pub group: PalGroup,
+    /// 是否头领（阿尔法）帕鲁；同步时按 BOSS_ 物种前缀标记
+    #[serde(default)]
+    pub is_boss: bool,
+    /// 最爱标记：0=无，1/2/3 对应游戏内 I/II/III
+    #[serde(default)]
+    pub favorite: u8,
+    /// 幸运（闪光）帕鲁标记，对应游戏 IsRarePal
+    #[serde(default)]
+    pub is_lucky: bool,
+    /// 游戏内昵称；未命名 → None（展示时回退物种名）
+    #[serde(default)]
+    pub nickname: Option<String>,
+}
+
+/// 帕鲁所在位置（同步自游戏的容器分组）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PalGroup {
+    Party,
+    #[default]
+    Box,
+    Base,
+}
+
+impl PalGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            PalGroup::Party => "队伍",
+            PalGroup::Box => "盒子",
+            PalGroup::Base => "据点",
+        }
+    }
 }
 
 /// 一个规划目标：想要得到的帕鲁 + 期望继承的被动
@@ -111,6 +146,9 @@ struct Entry {
     depth: u32,
     /// 血统中已持有个体覆盖的期望被动位掩码（bit i = desired[i]）
     passive_mask: u64,
+    /// 血统被动池（bit = pidx[被动]）：继承池去重后的全部词条。
+    /// 池越小，期望词条的继承成功率越高（机制：去重并集、均匀无放回）
+    pool: u128,
     male: bool,
     female: bool,
     via: Option<Via>,
@@ -132,6 +170,7 @@ struct Proposal {
     cost: u32,
     depth: u32,
     mask: u64,
+    pool: u128,
     via: Via,
 }
 
@@ -152,6 +191,8 @@ struct Planner<'a> {
     owned: &'a [OwnedPal],
     /// 期望被动（已去重，保序）
     desired: &'a [String],
+    /// 全局被动 → 池位（覆盖所有已持有帕鲁出现过的词条）
+    pidx: &'a HashMap<String, u32>,
     /// 用户钉选的亲本对：物种 internal_name → 无序亲本对（字典序）
     pins: &'a HashMap<String, (String, String)>,
     target: usize,
@@ -168,6 +209,7 @@ impl<'a> Planner<'a> {
         db: &'a BreedingDB,
         owned: &'a [OwnedPal],
         desired: &'a [String],
+        pidx: &'a HashMap<String, u32>,
         pins: &'a HashMap<String, (String, String)>,
         target: usize,
         coverage_first: bool,
@@ -176,6 +218,7 @@ impl<'a> Planner<'a> {
             db,
             owned,
             desired,
+            pidx,
             pins,
             target,
             coverage_first,
@@ -193,6 +236,16 @@ impl<'a> Planner<'a> {
             }
         }
         mask
+    }
+
+    /// 全部词条（含非期望）的池位掩码
+    fn pool_of(&self, passives: &[String]) -> u128 {
+        passives.iter().fold(0u128, |m, p| {
+            match self.pidx.get(p) {
+                Some(&i) => m | (1u128 << i),
+                None => m,
+            }
+        })
     }
 
     /// 排序键：升序更优
@@ -215,16 +268,24 @@ impl<'a> Planner<'a> {
         let male = pals.iter().any(|p| p.gender == Gender::Male);
         let female = pals.iter().any(|p| p.gender == Gender::Female);
         // 掩码取单只最大值而非并集：一次配种只能用一只个体，
-        // 并集会虚报覆盖（同种两只互补个体的合并由同种配种候选正确处理）
-        let mask = pals
+        // 并集会虚报覆盖（同种两只互补个体的合并由同种配种候选正确处理）。
+        // 池同样按该个体的词条计（覆盖最高者，平局取池更小的）。
+        let best = pals
             .iter()
-            .map(|p| self.mask_of(&p.passives))
-            .max_by_key(|m| m.count_ones())
-            .unwrap_or(0);
+            .max_by_key(|p| {
+                (
+                    self.mask_of(&p.passives).count_ones(),
+                    std::cmp::Reverse(self.pool_of(&p.passives).count_ones()),
+                )
+            })
+            .expect("非空");
+        let mask = self.mask_of(&best.passives);
+        let pool = self.pool_of(&best.passives);
         Some(Entry {
             cost: 0,
             depth: 0,
             passive_mask: mask,
+            pool,
             male,
             female,
             via: None,
@@ -257,6 +318,7 @@ impl<'a> Planner<'a> {
         let cost = ea.cost + eb.cost + 1;
         let depth = ea.depth.max(eb.depth) + 1;
         let mask = ea.passive_mask | eb.passive_mask;
+        let pool = ea.pool | eb.pool;
         match self.db.breed(&a.internal_name, &b.internal_name) {
             Some(BreedOutcome::Normal(child)) => {
                 let kind = if self.db.is_unique_pair(&a.internal_name, &b.internal_name) {
@@ -264,7 +326,7 @@ impl<'a> Planner<'a> {
                 } else {
                     BreedKind::Formula
                 };
-                self.push(heap, child, cost, depth, mask, Via { a: ra, b: rb, kind });
+                self.push(heap, child, cost, depth, mask, pool, Via { a: ra, b: rb, kind });
             }
             Some(BreedOutcome::GenderDependent {
                 if_p1_female,
@@ -272,14 +334,14 @@ impl<'a> Planner<'a> {
             }) => {
                 // 子代取决于哪只亲本是雌性；对应亲本条目必须有雌性
                 if ea.female {
-                    self.push(heap, if_p1_female, cost, depth, mask, Via {
+                    self.push(heap, if_p1_female, cost, depth, mask, pool, Via {
                         a: ra,
                         b: rb,
                         kind: BreedKind::GenderUnique,
                     });
                 }
                 if eb.female && if_p2_female != if_p1_female {
-                    self.push(heap, if_p2_female, cost, depth, mask, Via {
+                    self.push(heap, if_p2_female, cost, depth, mask, pool, Via {
                         a: ra,
                         b: rb,
                         kind: BreedKind::GenderUnique,
@@ -297,6 +359,7 @@ impl<'a> Planner<'a> {
         cost: u32,
         depth: u32,
         mask: u64,
+        pool: u128,
         via: Via,
     ) {
         let key = self.key(cost, depth, mask);
@@ -317,6 +380,7 @@ impl<'a> Planner<'a> {
             cost,
             depth,
             mask,
+            pool,
             via,
         });
     }
@@ -347,6 +411,7 @@ impl<'a> Planner<'a> {
                 cost: p.cost,
                 depth: p.depth,
                 passive_mask: p.mask,
+                pool: p.pool,
                 male: true,
                 female: true, // 后代性别假设：雌雄均可获得
                 via: Some(p.via),
@@ -709,7 +774,7 @@ impl Planner<'_> {
     }
 
     /// 已持有目标帕鲁时的平凡结果（0 次配种）。
-    fn trivial_plan(self, target: usize) -> Plan {
+    fn trivial_plan(self, target: usize, alternatives: HashMap<String, Vec<Alternative>>) -> Plan {
         let pal = self.pick_owned(target, None);
         Plan {
             root: PlanNode {
@@ -720,7 +785,7 @@ impl Planner<'_> {
             total_breedings: 0,
             generations: 0,
             used_owned: vec![pal.id],
-            alternatives: HashMap::new(),
+            alternatives,
         }
     }
 }
@@ -772,16 +837,24 @@ fn plan_inner(
         }
     }
 
-    // 已持有目标且单只覆盖全部期望 → 直接完成（0 次配种）
-    let satisfied = owned.iter().any(|p| {
-        p.species == target && desired.iter().all(|d| p.passives.contains(d))
-    });
-    if satisfied {
-        return Ok(Planner::new(db, owned, &desired, pins, target_idx, false).trivial_plan(target_idx));
-    }
+    // 目标一律求配种路径（即便已持有——作为目标即表示要配种获得）。
+    // 仅在完全无法配种获得时，才回退展示已持有个体。
+
+    // 池位索引：覆盖所有已持有帕鲁出现过的词条（含非期望）
+    let pidx: HashMap<String, u32> = {
+        let mut m = HashMap::new();
+        for p in owned {
+            for ps in &p.passives {
+                if !m.contains_key(ps) {
+                    m.insert(ps.clone(), m.len() as u32);
+                }
+            }
+        }
+        m
+    };
 
     // A：最少配种次数优先
-    let mut a = Planner::new(db, owned, &desired, pins, target_idx, false);
+    let mut a = Planner::new(db, owned, &desired, &pidx, pins, target_idx, false);
     let best_a = a.run();
     let full_of = |mask: u64| mask.count_ones() as usize == desired.len();
     let mask_of = |passives: &[String]| -> u64 {
@@ -793,11 +866,17 @@ fn plan_inner(
             }
         })
     };
+    let pool_of = |passives: &[String]| -> u128 {
+        passives.iter().fold(0u128, |m, p| match pidx.get(p) {
+            Some(&i) => m | (1u128 << i),
+            None => m,
+        })
+    };
 
     // C：同种合并链——把多只已持有同种的被动逐步合并（X×X→X 反复进行）。
-    // 选种取并集最大的异性对，之后贪心并入仍有新增覆盖的个体；
-    // 配种产物性别按均可获得处理，因此链上每步都可行。
-    let same_chain: Option<(Vec<u64>, u64)> = {
+    // 选种取并集最大（平局取池更小）的异性对，之后按"新增覆盖多、垃圾词条少"
+    // 贪心并入；配种产物性别按均可获得处理，因此链上每步都可行。
+    let same_chain: Option<(Vec<u64>, u64, u128)> = {
         let inds: Vec<&OwnedPal> = owned
             .iter()
             .filter(|p| p.species == target && mask_of(&p.passives) > 0)
@@ -805,35 +884,49 @@ fn plan_inner(
         if inds.len() < 2 {
             None
         } else {
-            let mut seed: Option<(&OwnedPal, &OwnedPal, u64)> = None;
+            let mut seed: Option<(&OwnedPal, &OwnedPal, u64, u128)> = None;
             for x in &inds {
                 for y in &inds {
                     if x.id >= y.id || x.gender == y.gender {
                         continue;
                     }
                     let m = mask_of(&x.passives) | mask_of(&y.passives);
-                    if seed.is_none_or(|(_, _, bm)| m.count_ones() > bm.count_ones()) {
-                        seed = Some((x, y, m));
+                    let pool = pool_of(&x.passives) | pool_of(&y.passives);
+                    let better = seed.is_none_or(|(_, _, bm, bp)| {
+                        (m.count_ones(), std::cmp::Reverse(pool.count_ones()))
+                            > (bm.count_ones(), std::cmp::Reverse(bp.count_ones()))
+                    });
+                    if better {
+                        seed = Some((x, y, m, pool));
                     }
                 }
             }
-            seed.map(|(a, b, m)| {
+            seed.map(|(a, b, m, pool)| {
                 let mut order = vec![a.id, b.id];
                 let mut acc = m;
-                let mut rest: Vec<&OwnedPal> = inds
+                let mut acc_pool = pool;
+                let mut rest: Vec<(&OwnedPal, u32, u32)> = inds
                     .iter()
                     .copied()
                     .filter(|p| p.id != a.id && p.id != b.id)
+                    .map(|p| {
+                        let new_bits = (mask_of(&p.passives) & !acc).count_ones();
+                        let junk = (pool_of(&p.passives) & !acc_pool).count_ones();
+                        (p, new_bits, junk)
+                    })
                     .collect();
-                rest.sort_by_key(|p| std::cmp::Reverse(mask_of(&p.passives).count_ones()));
-                for p in rest {
-                    let m = mask_of(&p.passives);
-                    if m | acc != acc {
-                        acc |= m;
+                // 新增覆盖多者优先，平局取带入垃圾词条少者
+                rest.sort_by_key(|(_, new_bits, junk)| {
+                    (std::cmp::Reverse(*new_bits), *junk)
+                });
+                for (p, new_bits, _) in rest {
+                    if new_bits > 0 {
+                        acc |= mask_of(&p.passives);
+                        acc_pool |= pool_of(&p.passives);
                         order.push(p.id);
                     }
                 }
-                (order, acc)
+                (order, acc, acc_pool)
             })
         }
     };
@@ -842,40 +935,56 @@ fn plan_inner(
     let mut b_planner = None;
     let mut best_b = None;
     if !desired.is_empty() && best_a.as_ref().is_none_or(|e| !full_of(e.passive_mask)) {
-        let mut b = Planner::new(db, owned, &desired, pins, target_idx, true);
+        let mut b = Planner::new(db, owned, &desired, &pidx, pins, target_idx, true);
         best_b = b.run();
         b_planner = Some(b);
     }
 
-    // 候选统一比较：全覆盖优先 → 覆盖更多 → 总次数更少
-    // key = (!full, Reverse(covered), cost)，取最小
+    // 候选统一比较：全覆盖优先 → 覆盖更多 → 池更干净 → 总次数更少
+    // key = (!full, Reverse(covered), pool_size, cost)，取最小
     #[derive(PartialEq, Eq, PartialOrd, Ord)]
-    struct CandKey(u8, std::cmp::Reverse<u32>, u32);
-    let key = |full: bool, cov: u32, cost: u32| CandKey(!full as u8, std::cmp::Reverse(cov), cost);
+    struct CandKey(u8, std::cmp::Reverse<u32>, u32, u32);
+    let key = |full: bool, cov: u32, pool: u32, cost: u32| {
+        CandKey(!full as u8, std::cmp::Reverse(cov), pool, cost)
+    };
 
     let mut winner: Option<(CandKey, usize)> = None; // 0=A 1=B 2=C
-    let mut consider = |k: CandKey, which: usize, winner: &mut Option<(CandKey, usize)>| {
+    let consider = |k: CandKey, which: usize, winner: &mut Option<(CandKey, usize)>| {
         if winner.as_ref().is_none_or(|(wk, _)| k < *wk) {
             *winner = Some((k, which));
         }
     };
     if let Some(e) = &best_a {
         consider(
-            key(full_of(e.passive_mask), e.passive_mask.count_ones(), e.cost),
+            key(
+                full_of(e.passive_mask),
+                e.passive_mask.count_ones(),
+                e.pool.count_ones(),
+                e.cost,
+            ),
             0,
             &mut winner,
         );
     }
     if let Some(e) = &best_b {
         consider(
-            key(full_of(e.passive_mask), e.passive_mask.count_ones(), e.cost),
+            key(
+                full_of(e.passive_mask),
+                e.passive_mask.count_ones(),
+                e.pool.count_ones(),
+                e.cost,
+            ),
             1,
             &mut winner,
         );
     }
-    if let Some((order, mask)) = &same_chain {
+    if let Some((order, mask, pool)) = &same_chain {
         let cost = (order.len() - 1) as u32;
-        consider(key(full_of(*mask), mask.count_ones(), cost), 2, &mut winner);
+        consider(
+            key(full_of(*mask), mask.count_ones(), pool.count_ones(), cost),
+            2,
+            &mut winner,
+        );
     }
 
     match winner.map(|(_, w)| w) {
@@ -888,15 +997,15 @@ fn plan_inner(
             Ok(b_planner.unwrap().into_plan(target_idx, &e))
         }
         Some(2) => {
-            let (order, _) = same_chain.unwrap();
+            let (order, _, _) = same_chain.unwrap();
             let alternatives = a.collect_alternatives(target_idx);
             Ok(build_same_chain(owned, target, &order, alternatives))
         }
         _ => {
             // 没有可行配种路径：已持有（被动不符）则如实展示，否则报告不可达
             if owned.iter().any(|p| p.species == target) {
-                return Ok(Planner::new(db, owned, &desired, pins, target_idx, false)
-                    .trivial_plan(target_idx));
+                return Ok(Planner::new(db, owned, &desired, &pidx, pins, target_idx, false)
+                    .trivial_plan(target_idx, HashMap::new()));
             }
             Err(PlanError::Unreachable {
                 target: target.to_string(),
@@ -987,6 +1096,11 @@ mod tests {
             species: species.into(),
             gender,
             passives: passives.iter().map(|s| s.to_string()).collect(),
+            group: PalGroup::Box,
+            is_boss: false,
+            favorite: 0,
+            nickname: None,
+            is_lucky: false,
         }
     }
 
@@ -1384,5 +1498,31 @@ mod tests {
         };
         assert!(matches!(p1.source, PlanSource::Bred { .. }));
         assert!(matches!(p2.source, PlanSource::Owned { .. }));
+    }
+
+    /// 池感知：覆盖相同时，优先选择垃圾词条更少（继承池更干净）的亲本路径。
+    #[test]
+    fn cleaner_pool_wins_on_tie() {
+        // P1(190)×P2(210) → T(200)，P3(190)×P4(210) → T(200)，同为 cost 1 全覆盖
+        // P1 只带 lucky（池 1），P3 带 lucky+垃圾（池 2）→ 应选 P1 路径
+        let db = BreedingDB::new(
+            vec![
+                pal("P1", 190, 1, false),
+                pal("P2", 210, 2, false),
+                pal("P3", 190, 3, false),
+                pal("P4", 210, 4, false),
+                pal("T", 200, 5, true),
+            ],
+            vec![],
+        );
+        let owned = vec![
+            owned(1, "P1", Gender::Male, &["lucky"]),
+            owned(2, "P2", Gender::Female, &[]),
+            owned(3, "P3", Gender::Male, &["lucky", "clumsy"]),
+            owned(4, "P4", Gender::Female, &[]),
+        ];
+        let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
+        assert!(plan.used_owned.contains(&1));
+        assert!(!plan.used_owned.contains(&3));
     }
 }

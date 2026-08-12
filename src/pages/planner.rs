@@ -10,11 +10,14 @@ use crate::sidebar::passive_badge_kind;
 use crate::ui::{Badge, BtnVariant, Button, ComboOption, Combobox, Dialog};
 use crate::{OwnedStore, PlannerSideState, TargetsStore, db, icon_url, passive_by_internal, passives};
 use dioxus::prelude::*;
-use dioxus_flow::{EdgeEmphasis, FlowCanvas, NodeId, Size, Viewport, fit_viewport};
+use dioxus_flow::{EdgeEmphasis, FlowCanvas, NodeId, RenderNode, Size, Viewport, fit_viewport};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
+
+/// 用户钉选表：目标 id →（物种 → 无序亲本对）。钉选按目标隔离并持久化。
+type PinsMap = HashMap<u64, HashMap<String, (String, String)>>;
 
 #[component]
 pub fn PlannerPage() -> Element {
@@ -25,23 +28,39 @@ pub fn PlannerPage() -> Element {
     let animate = use_signal(|| false);
     let hovered = use_signal(|| None::<String>);
     let shell_el = use_hook(|| Rc::new(RefCell::new(None::<web_sys::Element>)));
-    // 用户钉选的亲本对（物种 → 无序亲本对），localStorage 持久化
-    let pins = crate::storage::use_persistent(
-        "pal-companion:pins",
-        std::collections::HashMap::<String, (String, String)>::new,
-    );
+    // 用户钉选的亲本对（按目标 id 隔离），localStorage 持久化。
+    // 旧版全局格式反序列化失败会自动回退为空表。
+    let mut pins = crate::storage::use_persistent("pal-companion:pins", PinsMap::new);
 
     // 选中目标 → 自动计算路径（持有列表、目标或钉选变更都会触发重算）
     let result = use_memo(move || {
         let id = (*selected.read())?;
         let goal = targets.goals.read().iter().find(|g| g.id == id).cloned()?;
+        let goal_pins = pins.read().get(&id).cloned().unwrap_or_default();
         Some(plan_with_pins(
             db(),
             &store.pals.read(),
             &goal.species,
             &goal.desired_passives,
-            &pins.read(),
+            &goal_pins,
         ))
+    });
+
+    // 目标被删除/导入替换后，清理残留目标的钉选
+    use_effect(move || {
+        let valid: HashSet<u64> = targets.goals.read().iter().map(|g| g.id).collect();
+        let stale: Vec<u64> = pins
+            .peek()
+            .keys()
+            .filter(|k| !valid.contains(k))
+            .copied()
+            .collect();
+        if !stale.is_empty() {
+            let mut guard = pins.write();
+            for k in stale {
+                guard.remove(&k);
+            }
+        }
     });
 
     let graph = use_memo(move || {
@@ -145,6 +164,7 @@ pub fn PlannerPage() -> Element {
                     .map(|p| Rc::new(p.alternatives.clone()))
                     .unwrap_or_default(),
                 pins,
+                goal_id: *selected.read(),
                 desired: {
                     let id = *selected.read();
                     id.and_then(|id| {
@@ -169,7 +189,7 @@ fn TargetSidebar(
     selected: Signal<Option<u64>>,
     result: Memo<Option<Result<Plan, PlanError>>>,
     graph: Memo<Option<GraphData>>,
-    pins: Signal<HashMap<String, (String, String)>>,
+    pins: Signal<PinsMap>,
 ) -> Element {
     let targets = use_context::<TargetsStore>();
     let side = use_context::<PlannerSideState>();
@@ -333,19 +353,56 @@ fn TargetSidebar(
                     _ => rsx! {},
                 }
 
-                if !pins.read().is_empty() {
-                    Button {
-                        variant: BtnVariant::Ghost,
-                        sm: true,
-                        class: "side-reset",
-                        onclick: move |_| pins.set(HashMap::new()),
-                        "重置全部亲本方案"
+                // 当前目标钉选的亲本方案（钉选按目标隔离，随目标切换）
+                if current.is_some_and(|id| pins.read().get(&id).is_some_and(|m| !m.is_empty())) {
+                    {
+                        let mut sorted: Vec<(String, (String, String))> = current
+                            .and_then(|id| pins.read().get(&id).cloned())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect();
+                        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                        rsx! {
+                            div { class: "pin-list",
+                                div { class: "pin-list-title", "钉选的亲本方案" }
+                                for (species, (p1, p2)) in sorted {
+                                    {
+                                        let sp_name = db().pal(&species).map(|p| p.name_zh.clone()).unwrap_or_else(|| species.clone());
+                                        let n1 = db().pal(&p1).map(|p| p.name_zh.clone()).unwrap_or_else(|| p1.clone());
+                                        let n2 = db().pal(&p2).map(|p| p.name_zh.clone()).unwrap_or_else(|| p2.clone());
+                                        let sp = species.clone();
+                                        rsx! {
+                                            span { key: "{species}", class: "chip",
+                                                "{sp_name} = {n1} + {n2}"
+                                                button {
+                                                    onclick: move |_| {
+                                                        remove_pin(pins, current, &sp);
+                                                    },
+                                                    "×"
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Button {
+                                    variant: BtnVariant::Ghost,
+                                    sm: true,
+                                    class: "side-reset",
+                                    onclick: move |_| {
+                                        if let Some(id) = current {
+                                            pins.write().remove(&id);
+                                        }
+                                    },
+                                    "全部清除"
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        TargetFormDialog { open: dialog_open, editing: editing.read().clone(), selected }
+        TargetFormDialog { open: dialog_open, editing: editing.read().clone(), selected, pins }
     }
 }
 
@@ -355,6 +412,7 @@ fn TargetFormDialog(
     open: Signal<bool>,
     editing: Option<TargetGoal>,
     mut selected: Signal<Option<u64>>,
+    mut pins: Signal<PinsMap>,
 ) -> Element {
     let targets = use_context::<TargetsStore>();
     let mut goals = targets.goals;
@@ -397,13 +455,22 @@ fn TargetFormDialog(
         let desired: Vec<String> = slots.iter().filter_map(|s| s.read().clone()).collect();
         match &editing_for_save {
             Some(old) => {
-                let mut list = goals.write();
-                if let Some(entry) = list.iter_mut().find(|x| x.id == old.id) {
-                    *entry = TargetGoal {
-                        id: old.id,
-                        species: sp,
-                        desired_passives: desired,
-                    };
+                let species_changed = {
+                    let mut list = goals.write();
+                    let mut changed = false;
+                    if let Some(entry) = list.iter_mut().find(|x| x.id == old.id) {
+                        changed = entry.species != sp;
+                        *entry = TargetGoal {
+                            id: old.id,
+                            species: sp,
+                            desired_passives: desired,
+                        };
+                    }
+                    changed
+                };
+                // 换了目标物种后，原先针对旧树的钉选不再适用
+                if species_changed {
+                    pins.write().remove(&old.id);
                 }
             }
             None => {
@@ -466,6 +533,7 @@ fn TargetFormDialog(
                         onclick: move |_| {
                             if let Some(old) = &editing_for_delete {
                                 goals.write().retain(|x| x.id != old.id);
+                                pins.write().remove(&old.id);
                                 if *selected.read() == Some(old.id) {
                                     selected.set(None);
                                 }
@@ -490,20 +558,35 @@ fn TargetFormDialog(
     }
 }
 
-/// 应用亲本组合选择：显式钉选选中项；解除钉选走 remove_pin。
+/// 应用亲本组合选择：在当前目标下显式钉选选中项；解除钉选走 remove_pin。
 fn apply_alt_choice(
-    mut pins: Signal<HashMap<String, (String, String)>>,
+    mut pins: Signal<PinsMap>,
+    goal_id: Option<u64>,
     species: &str,
     alts: &[Alternative],
     idx: usize,
 ) {
-    let mut map = pins.write();
-    map.insert(species.to_string(), alts[idx].parents.clone());
+    let Some(gid) = goal_id else { return };
+    pins.write()
+        .entry(gid)
+        .or_default()
+        .insert(species.to_string(), alts[idx].parents.clone());
 }
 
 /// 解除某物种的钉选，恢复自动最优。
-fn remove_pin(mut pins: Signal<HashMap<String, (String, String)>>, species: &str) {
-    pins.write().remove(species);
+fn remove_pin(mut pins: Signal<PinsMap>, goal_id: Option<u64>, species: &str) {
+    let Some(gid) = goal_id else { return };
+    let mut guard = pins.write();
+    let now_empty = match guard.get_mut(&gid) {
+        Some(m) => {
+            m.remove(species);
+            m.is_empty()
+        }
+        None => false,
+    };
+    if now_empty {
+        guard.remove(&gid);
+    }
 }
 
 /// 短暂开启视口过渡动画（约 400ms 后关闭，避免影响拖拽手感）。
@@ -532,17 +615,19 @@ fn PlanGraph(
     desired: Vec<String>,
     /// 各物种可选亲本组合（来自 plan.alternatives）
     alternatives: Rc<HashMap<String, Vec<Alternative>>>,
-    /// 用户钉选的亲本对（持久化 signal）
-    mut pins: Signal<HashMap<String, (String, String)>>,
+    /// 用户钉选的亲本对（按目标隔离，持久化 signal）
+    mut pins: Signal<PinsMap>,
+    /// 当前选中的目标 id（钉选写入/读取的隔离键）
+    goal_id: Option<u64>,
 ) -> Element {
     let side = use_context::<PlannerSideState>();
     let store = use_context::<OwnedStore>();
     let mut side_open = side.open;
     // 平移拖拽期间抑制 hover 更新（无关渲染会用旧 signal 值重写 style 造成瞬跳）
     let mut panning = use_signal(|| false);
-    // 亲本组合完整列表弹窗：(物种, 备选列表, 当前索引)
+    // 亲本组合完整列表弹窗：(目标 id, 物种, 备选列表, 当前索引)
     let mut alt_dialog_open = use_signal(|| false);
-    let mut alt_dialog_data = use_signal(|| None::<(String, Vec<Alternative>, usize)>);
+    let mut alt_dialog_data = use_signal(|| None::<(u64, String, Vec<Alternative>, Option<usize>)>);
     let (nodes, base_edges, info, root_id) = match graph {
         Some(g) => (g.nodes, g.edges, g.info, g.root_id),
         None => (Vec::new(), Vec::new(), HashMap::new(), String::new()),
@@ -696,7 +781,7 @@ fn PlanGraph(
             .collect::<Vec<_>>()
             .join("、");
 
-        // 备选亲本组合切换器（配种节点，备选 >1 时显示在入边交汇处）
+        // 备选亲本组合切换器：配种节点（备选 >1）显示在入边交汇处
         let alt_switch = if let PlanSource::Bred { p1, p2, .. } = &node.source {
             let mut vp = [p1.species.clone(), p2.species.clone()];
             vp.sort();
@@ -705,10 +790,10 @@ fn PlanGraph(
                 .get(&node.species)
                 .filter(|alts| alts.len() > 1)
                 .map(|alts| {
-                    let cur = pins
-                        .peek()
-                        .get(&node.species)
-                        .and_then(|p| alts.iter().position(|a| a.parents == *p))
+                    let cur = goal_id
+                        .and_then(|gid| pins.peek().get(&gid).cloned())
+                        .and_then(|m| m.get(&node.species).cloned())
+                        .and_then(|p| alts.iter().position(|a| a.parents == p))
                         .or_else(|| alts.iter().position(|a| a.parents == via_pair))
                         .unwrap_or(0);
                     (alts.clone(), cur)
@@ -771,7 +856,7 @@ fn PlanGraph(
                                 button {
                                     onclick: move |_| {
                                         let next = ((cur as i32 - 1 + len as i32) % len as i32) as usize;
-                                        apply_alt_choice(pins, &sp_prev, &alts_prev, next);
+                                        apply_alt_choice(pins, goal_id, &sp_prev, &alts_prev, next);
                                     },
                                     "▲"
                                 }
@@ -779,15 +864,17 @@ fn PlanGraph(
                                     class: "alt-num",
                                     title: "查看全部亲本组合",
                                     onclick: move |_| {
-                                        alt_dialog_data.set(Some((sp_num.clone(), alts_num.clone(), cur)));
-                                        alt_dialog_open.set(true);
+                                        if let Some(gid) = goal_id {
+                                            alt_dialog_data.set(Some((gid, sp_num.clone(), alts_num.clone(), Some(cur))));
+                                            alt_dialog_open.set(true);
+                                        }
                                     },
                                     "{cur + 1}/{len}"
                                 }
                                 button {
                                     onclick: move |_| {
                                         let next = (cur + 1) % len;
-                                        apply_alt_choice(pins, &sp_next, &alts_next, next);
+                                        apply_alt_choice(pins, goal_id, &sp_next, &alts_next, next);
                                     },
                                     "▼"
                                 }
@@ -843,7 +930,7 @@ fn PlanGraph(
                 nodes,
                 edges,
                 viewport,
-                render_node,
+                render_node: RenderNode::new(render_node),
                 on_node_move: |_| {},
                 on_node_click: |_| {},
                 animate: *animate.read(),
@@ -854,21 +941,25 @@ fn PlanGraph(
             }
 
             // 亲本组合完整列表弹窗
-            if let Some((species, alts, cur)) = alt_dialog_data.read().clone() {
+            if let Some((gid, species, alts, cur)) = alt_dialog_data.read().clone() {
                 {
                     let sp = db().pal(&species).unwrap();
                     let title = format!("{} 的亲本组合", sp.name_zh);
-                    let is_pinned = pins.read().contains_key(&species);
+                    let is_pinned = pins
+                        .read()
+                        .get(&gid)
+                        .is_some_and(|m| m.contains_key(&species));
                     rsx! {
                         Dialog {
                             open: alt_dialog_open,
                             title,
                             description: "选择用于配种路径的亲本组合".to_string(),
                             div { class: "alt-list",
+                                // 首行：恢复自动（未钉选时高亮）
                                 button {
                                     class: if is_pinned { "alt-row" } else { "alt-row active" },
                                     onclick: move |_| {
-                                        remove_pin(pins, &species);
+                                        remove_pin(pins, Some(gid), &species);
                                         alt_dialog_open.set(false);
                                     },
                                     span { class: "alt-name", "自动（规划器最优）" }
@@ -885,12 +976,16 @@ fn PlanGraph(
                                         let pair = alt.parents.clone();
                                         let species_for_click = species.clone();
                                         let alts_for_click = alts.clone();
+                                        let active = match cur {
+                                            None => false,
+                                            Some(c) => is_pinned && i == c,
+                                        };
                                         rsx! {
                                             button {
                                                 key: "{pair.0}+{pair.1}",
-                                                class: if is_pinned && i == cur { "alt-row active" } else { "alt-row" },
+                                                class: if active { "alt-row active" } else { "alt-row" },
                                                 onclick: move |_| {
-                                                    apply_alt_choice(pins, &species_for_click, &alts_for_click, i);
+                                                    apply_alt_choice(pins, Some(gid), &species_for_click, &alts_for_click, i);
                                                     alt_dialog_open.set(false);
                                                 },
                                                 img { src: icon_url(&pair.0), alt: "" }

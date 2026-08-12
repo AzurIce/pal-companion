@@ -1,7 +1,7 @@
 //! 我的帕鲁侧边栏：筛选 / 排序 / 添加 / 编辑 / 删除。
 
 use crate::pages::calculator::pal_options;
-use crate::planner::{Gender, OwnedPal, TargetGoal};
+use crate::planner::{Gender, OwnedPal, PalGroup, TargetGoal};
 use crate::ui::{
     Badge, BadgeKind, BtnVariant, Button, ComboOption, Combobox, Dialog, Segment, Segmented,
 };
@@ -150,7 +150,8 @@ pub fn OwnedSidebar() -> Element {
     let store = use_context::<OwnedStore>();
     let targets = use_context::<TargetsStore>();
     let mut filter = use_signal(String::new);
-    let sort = use_signal(|| "dex".to_string());
+    // 分组 tab：all / party / box / base（同步来的帕鲁带容器分组）
+    let tab = use_signal(|| "all".to_string());
     let mut dialog_open = use_signal(|| false);
     let mut editing = use_signal(|| None::<OwnedPal>);
     let mut import_open = use_signal(|| false);
@@ -160,23 +161,22 @@ pub fn OwnedSidebar() -> Element {
     let mut copied = use_signal(|| false);
 
     let q = filter.read().to_lowercase();
+    let group_tab = tab.read().clone();
     let mut list: Vec<OwnedPal> = store
         .pals
         .read()
         .iter()
         .filter(|p| matches_query(p, &q))
+        .filter(|p| {
+            group_tab == "all"
+                || (group_tab == "party" && p.group == PalGroup::Party)
+                || (group_tab == "box" && p.group == PalGroup::Box)
+                || (group_tab == "base" && p.group == PalGroup::Base)
+        })
         .cloned()
         .collect();
-    match sort.read().as_str() {
-        "name" => list.sort_by(|a, b| {
-            let da = db().pal(&a.species);
-            let db_ = db().pal(&b.species);
-            da.map(|p| &p.name_zh).cmp(&db_.map(|p| &p.name_zh))
-        }),
-        "power" => list.sort_by_key(|p| db().pal(&p.species).map(|s| s.breeding_power)),
-        "added" => list.sort_by_key(|p| std::cmp::Reverse(p.id)),
-        _ => list.sort_by_key(|p| db().pal(&p.species).map(|s| s.paldex_no)),
-    }
+    // 统一按图鉴编号排序
+    list.sort_by_key(|p| db().pal(&p.species).map(|s| s.paldex_no));
 
     let open = *state.open.read();
     let total = store.pals.read().len();
@@ -258,14 +258,16 @@ pub fn OwnedSidebar() -> Element {
                 div { class: "sidebar-sort",
                     Segmented {
                         options: vec![
-                            Segment { value: "dex".to_string(), label: "图鉴".to_string() },
-                            Segment { value: "name".to_string(), label: "名称".to_string() },
-                            Segment { value: "power".to_string(), label: "配种值".to_string() },
-                            Segment { value: "added".to_string(), label: "最新".to_string() },
+                            Segment { value: "all".to_string(), label: "全部".to_string() },
+                            Segment { value: "party".to_string(), label: "队伍".to_string() },
+                            Segment { value: "box".to_string(), label: "盒子".to_string() },
+                            Segment { value: "base".to_string(), label: "据点".to_string() },
                         ],
-                        value: sort,
+                        value: tab,
                     }
                 }
+                // 游戏同步提示条（有待确认列表时出现）
+                crate::sync_client::SyncBanner {}
                 div { class: "sidebar-list",
                     if list.is_empty() {
                         div { class: "sidebar-empty",
@@ -297,7 +299,22 @@ pub fn OwnedSidebar() -> Element {
                                     img { src: icon_url(&pal.species), alt: "{sp.name_zh}" }
                                     div { class: "owned-item-main",
                                         div { class: "owned-item-name",
-                                            "{sp.name_zh}"
+                                            span { class: "dex-no", "#{sp.paldex_no}" }
+                                            if let Some(nick) = &pal.nickname {
+                                                "{nick}"
+                                                span { class: "species-sub", "{sp.name_zh}" }
+                                            } else {
+                                                "{sp.name_zh}"
+                                            }
+                                            if pal.is_boss {
+                                                span { class: "boss-tag", "头领" }
+                                            }
+                                            if pal.is_lucky {
+                                                span { class: "lucky-tag", "幸运" }
+                                            }
+                                            if pal.favorite > 0 {
+                                                span { class: "fav-tag", "{[\"\", \"I\", \"II\", \"III\"][pal.favorite.min(3) as usize]}" }
+                                            }
                                             span { class: "gender-tag {gender_class}", "{pal.gender.symbol()}" }
                                         }
                                         if !pal.passives.is_empty() {
@@ -443,6 +460,10 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
 
     let mut species = use_signal(|| None::<String>);
     let mut gender = use_signal(|| "male".to_string());
+    let mut is_boss = use_signal(|| false);
+    let mut is_lucky = use_signal(|| false);
+    let mut favorite = use_signal(|| "0".to_string());
+    let mut nickname = use_signal(String::new);
     let slots: [Signal<Option<String>>; 4] = [
         use_signal(|| None),
         use_signal(|| None),
@@ -464,6 +485,10 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                         }
                         .to_string(),
                     );
+                    is_boss.set(p.is_boss);
+                    is_lucky.set(p.is_lucky);
+                    favorite.set(p.favorite.min(3).to_string());
+                    nickname.set(p.nickname.clone().unwrap_or_default());
                     for (i, mut s) in slots.into_iter().enumerate() {
                         s.set(p.passives.get(i).cloned());
                     }
@@ -471,6 +496,10 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                 None => {
                     species.set(None);
                     gender.set("male".to_string());
+                    is_boss.set(false);
+                    is_lucky.set(false);
+                    favorite.set("0".to_string());
+                    nickname.set(String::new());
                     for mut s in slots {
                         s.set(None);
                     }
@@ -495,22 +524,30 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
             Some(old) => {
                 let mut list = pals.write();
                 if let Some(entry) = list.iter_mut().find(|x| x.id == old.id) {
-                    *entry = OwnedPal {
-                        id: old.id,
-                        species: sp,
-                        gender: g,
-                        passives,
-                    };
+                    entry.species = sp;
+                    entry.gender = g;
+                    entry.passives = passives;
+                    entry.is_boss = *is_boss.read();
+                    entry.is_lucky = *is_lucky.read();
+                    entry.favorite = favorite.read().parse().unwrap_or(0);
+                    let n = nickname.read().trim().to_string();
+                    entry.nickname = if n.is_empty() { None } else { Some(n) };
                 }
             }
             None => {
                 let mut list = pals.write();
                 let id = list.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+                let n = nickname.read().trim().to_string();
                 list.push(OwnedPal {
                     id,
                     species: sp,
                     gender: g,
                     passives,
+                    group: PalGroup::Box,
+                    is_boss: *is_boss.read(),
+                    is_lucky: *is_lucky.read(),
+                    favorite: favorite.read().parse().unwrap_or(0),
+                    nickname: if n.is_empty() { None } else { Some(n) },
                 });
             }
         }
@@ -530,6 +567,15 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                 Combobox { options: pal_options().to_vec(), value: species, placeholder: "搜索帕鲁…" }
             }
             div { class: "form-row",
+                label { class: "field-label", "昵称（可留空）" }
+                input {
+                    class: "input",
+                    value: "{nickname}",
+                    placeholder: "游戏内昵称",
+                    oninput: move |e| nickname.set(e.value()),
+                }
+            }
+            div { class: "form-row",
                 label { class: "field-label", "性别" }
                 Segmented {
                     options: vec![
@@ -540,6 +586,36 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                 }
             }
             div { class: "form-row",
+                label { class: "field-label", "头领" }
+                input {
+                    r#type: "checkbox",
+                    class: "boss-checkbox",
+                    checked: is_boss,
+                    onchange: move |e| is_boss.set(e.checked()),
+                }
+            }
+            div { class: "form-row",
+                label { class: "field-label", "幸运" }
+                input {
+                    r#type: "checkbox",
+                    class: "boss-checkbox",
+                    checked: is_lucky,
+                    onchange: move |e| is_lucky.set(e.checked()),
+                }
+            }
+            div { class: "form-row",
+                label { class: "field-label", "最爱" }
+                Segmented {
+                    options: vec![
+                        Segment { value: "0".to_string(), label: "无".to_string() },
+                        Segment { value: "1".to_string(), label: "I".to_string() },
+                        Segment { value: "2".to_string(), label: "II".to_string() },
+                        Segment { value: "3".to_string(), label: "III".to_string() },
+                    ],
+                    value: favorite,
+                }
+            }
+            div { class: "form-row",
                 label { class: "field-label", "被动技能（最多 4 个，可留空）" }
                 for (i, slot) in slots.into_iter().enumerate() {
                     div { key: "slot{i}", style: "margin-bottom: 8px;",
@@ -547,6 +623,12 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                             options: passive_options(),
                             value: slot,
                             placeholder: "被动技能 {i + 1}",
+                        }
+                        // 选中后显示被动的具体效果
+                        if let Some(ps) = slot.read().as_ref() {
+                            if let Some(pp) = passive_by_internal(ps) {
+                                div { class: "passive-desc", "{pp.desc_zh}" }
+                            }
                         }
                     }
                 }

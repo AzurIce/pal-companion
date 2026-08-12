@@ -6,7 +6,7 @@ mod breeding;
 mod planner;
 
 use breeding::{BreedOutcome, BreedingDB};
-use planner::{Gender, OwnedPal, PlanSource};
+use planner::{Gender, OwnedPal, PalGroup, PlanSource};
 use std::collections::HashMap;
 
 fn load_db() -> BreedingDB {
@@ -69,6 +69,11 @@ fn op(id: u64, species: &str, gender: Gender) -> OwnedPal {
         species: species.into(),
         gender,
         passives: vec![],
+        group: PalGroup::Box,
+        is_boss: false,
+        favorite: 0,
+        nickname: None,
+        is_lucky: false,
     }
 }
 
@@ -102,4 +107,49 @@ fn pin_alternative_takes_effect_with_real_data() {
             alt.parents
         );
     }
+}
+
+/// 真实数据复现用户场景：已持有沁莲龙♀（灵活/喜欢戏水），
+/// 规划鳍刀鱼路径时，沁莲龙节点必须是"已持有"而非"配种"。
+#[test]
+fn owned_lotusdragon_used_as_parent_not_bred() {
+    use planner::{Gender, PlanNode, PlanSource};
+    fn owned_with(id: u64, species: &str, gender: Gender, passives: &[&str]) -> OwnedPal {
+        OwnedPal {
+            id,
+            species: species.into(),
+            gender,
+            passives: passives.iter().map(|s| s.to_string()).collect(),
+            group: PalGroup::Box,
+            is_boss: false,
+            favorite: 0,
+            nickname: None,
+            is_lucky: false,
+        }
+    }
+    fn nodes(root: &PlanNode, out: &mut Vec<PlanNode>) {
+        out.push(root.clone());
+        if let PlanSource::Bred { p1, p2, .. } = &root.source {
+            nodes(p1, out);
+            nodes(p2, out);
+        }
+    }
+    let db = load_db();
+    let owned = vec![
+        owned_with(1, "GrimGirl", Gender::Male, &[]),
+        owned_with(2, "GhostDragon", Gender::Male, &[]),
+        owned_with(3, "LotusDragon", Gender::Female, &["灵活", "喜欢戏水"]),
+        owned_with(4, "WeaselDragon", Gender::Male, &[]),
+        owned_with(5, "Umihebi_Fire", Gender::Male, &[]),
+        owned_with(6, "MonochromeQueen", Gender::Female, &[]),
+    ];
+    let p = planner::plan(&db, &owned, "SwordCutlassfish", &["灵活".to_string(), "喜欢戏水".to_string()]).unwrap();
+    let mut all = Vec::new();
+    nodes(&p.root, &mut all);
+    let lotus: Vec<&PlanNode> = all.iter().filter(|n| n.species == "LotusDragon").collect();
+    assert!(!lotus.is_empty(), "路径中应包含沁莲龙");
+    assert!(
+        lotus.iter().all(|n| matches!(n.source, PlanSource::Owned { .. })),
+        "已持有沁莲龙必须作为已持有节点使用，不得配种: {lotus:?}"
+    );
 }

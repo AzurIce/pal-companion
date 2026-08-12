@@ -4,6 +4,8 @@ mod pages;
 mod planner;
 mod sidebar;
 mod storage;
+mod sync;
+mod sync_client;
 mod theme;
 mod ui;
 
@@ -96,6 +98,15 @@ fn App() -> Element {
     use_context_provider(|| PlannerSideState {
         open: planner_side_open,
     });
+    // 游戏同步：状态 store + WebSocket 客户端（本地 mod 未启动时静默重试）
+    let auto_merge = storage::use_persistent("palcompanion_auto_merge", || false);
+    use_context_provider(|| sync_client::SyncStore {
+        status: Signal::new(sync_client::SyncStatus::Disconnected),
+        pending: Signal::new(Vec::new()),
+        auto_merge,
+        toast: Signal::new(None),
+    });
+    sync_client::use_ws_sync();
     rsx! {
         style { {include_str!("../assets/main.css")} }
         Router::<Route> {}
@@ -148,11 +159,16 @@ fn Navbar() -> Element {
                     }
                 }
             }
-            footer { class: "attribution",
-                "数据来自 "
-                a { href: "https://github.com/tylercamp/palcalc", "palcalc" }
-                " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
+            footer { class: "attribution statusbar",
+                // 页脚改为状态栏：左侧同步状态 + 自动合并开关，右侧素材说明
+                sync_client::SyncStatusBar {}
+                span { class: "attribution-text",
+                    "数据来自 "
+                    a { href: "https://github.com/tylercamp/palcalc", "palcalc" }
+                    " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
+                }
             }
+            sync_client::SyncToast {}
         }
     }
 }

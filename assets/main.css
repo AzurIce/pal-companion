@@ -263,6 +263,27 @@ footer.attribution { flex: none; }
     height: auto;
 }
 
+/* 钉选列表 */
+
+.pin-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 12px;
+    border: 1px dashed var(--border);
+    border-radius: var(--radius);
+}
+
+.pin-list-title {
+    width: 100%;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+}
+
+.pin-list .chip { font-size: 11.5px; }
+.pin-list .side-reset { margin-left: auto; }
+
 /* 亲本组合列表弹窗 */
 
 .alt-list {
@@ -1078,3 +1099,60 @@ footer.attribution a { color: inherit; text-decoration: underline; }
     .navbar { gap: 12px; padding: 0 16px; }
     .navbar .brand span { display: none; }
 }
+
+/* 游戏同步：提示条 + 侧栏底部状态行 */
+.sync-banner {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--muted);
+    font-size: 13px;
+}
+
+.sync-banner-text { flex: 1; }
+
+.sync-banner--done { color: var(--muted-foreground); }
+
+.sync-status {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted-foreground);
+}
+
+.sync-status-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--muted-foreground);
+    opacity: 0.5;
+}
+
+.sync-status-dot--on,
+.sync-status-dot--synced { background: hsl(142 71% 45%); opacity: 1; }
+
+/* 持有列表：图鉴编号 */
+.dex-no { color: var(--muted-foreground); font-size: 12px; margin-right: 4px; }
+/* 编辑弹窗：被动效果描述 */
+.passive-desc { color: var(--muted-foreground); font-size: 12px; margin-top: 4px; }
+
+/* 持有列表：头领 / 最爱 标记 */
+.boss-tag { font-size: 11px; color: #b45309; background: #fef3c7; border-radius: var(--radius, 4px); padding: 0 4px; margin-left: 4px; }
+.fav-tag { font-size: 11px; color: #b91c1c; margin-left: 4px; }
+.boss-checkbox { width: 16px; height: 16px; }
+
+/* 持有列表：昵称后的物种小字 */
+.species-sub { color: var(--muted-foreground); font-size: 12px; margin-left: 4px; }
+
+/* 状态栏与 toast */
+footer.statusbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; text-align: left; padding: 8px 24px; }
+.auto-merge-toggle { display: inline-flex; align-items: center; gap: 4px; margin-left: 12px; cursor: pointer; }
+.auto-merge-toggle input { width: 14px; height: 14px; }
+.sync-toast { position: fixed; right: 24px; bottom: 48px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius, 8px); padding: 10px 16px; box-shadow: 0 4px 16px rgba(0,0,0,.18); z-index: 100; font-size: 13px; }
+.lucky-tag { font-size: 11px; color: #a16207; background: #fef9c3; border-radius: var(--radius, 4px); padding: 0 4px; margin-left: 4px; }
