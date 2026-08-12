@@ -1247,6 +1247,7 @@ end))
 local forceSyncExperiment = {
     active = false,
     callbacks = 0,
+    callbackErrors = 0,
     uniqueSlots = {},
     pages = {},
     minSlot = nil,
@@ -1275,6 +1276,7 @@ end
 
 local function resetForceSyncExperiment()
     forceSyncExperiment.callbacks = 0
+    forceSyncExperiment.callbackErrors = 0
     forceSyncExperiment.uniqueSlots = {}
     forceSyncExperiment.pages = {}
     forceSyncExperiment.minSlot = nil
@@ -1283,27 +1285,32 @@ end
 
 local okRepHook, repHookErr = pcall(function()
     RegisterHook("/Script/Pal.PalIndividualCharacterSlot:OnRep_Parameter",
-        guarded("force-sync-onrep", function(Context)
+        function(Context)
             if not forceSyncExperiment.active then return end
-            local okSlot, slot = pcall(function() return Context:get() end)
-            if not (okSlot and isValid(slot)) then return end
+            local ok = pcall(function()
+                local slot = Context:get()
+                if not isValid(slot) then return end
 
-            forceSyncExperiment.callbacks = forceSyncExperiment.callbacks + 1
-            local okAddr, addr = pcall(function() return slot:GetAddress() end)
-            if okAddr then forceSyncExperiment.uniqueSlots[tostring(addr)] = true end
+                forceSyncExperiment.callbacks = forceSyncExperiment.callbacks + 1
+                local okAddr, addr = pcall(function() return slot:GetAddress() end)
+                if okAddr then forceSyncExperiment.uniqueSlots[tostring(addr)] = true end
 
-            local okIndex, index = pcall(function() return slot:GetSlotIndex() end)
-            if okIndex and type(index) == "number" and index >= 0 then
-                local page = math.floor(index / 30)
-                forceSyncExperiment.pages[page] = true
-                if forceSyncExperiment.minSlot == nil or index < forceSyncExperiment.minSlot then
-                    forceSyncExperiment.minSlot = index
+                local okIndex, index = pcall(function() return slot:GetSlotIndex() end)
+                if okIndex and type(index) == "number" and index >= 0 then
+                    local page = math.floor(index / 30)
+                    forceSyncExperiment.pages[page] = true
+                    if forceSyncExperiment.minSlot == nil or index < forceSyncExperiment.minSlot then
+                        forceSyncExperiment.minSlot = index
+                    end
+                    if forceSyncExperiment.maxSlot == nil or index > forceSyncExperiment.maxSlot then
+                        forceSyncExperiment.maxSlot = index
+                    end
                 end
-                if forceSyncExperiment.maxSlot == nil or index > forceSyncExperiment.maxSlot then
-                    forceSyncExperiment.maxSlot = index
-                end
+            end)
+            if not ok then
+                forceSyncExperiment.callbackErrors = forceSyncExperiment.callbackErrors + 1
             end
-        end))
+        end)
 end)
 print("[Palws] force-sync OnRep hook: "
     .. (okRepHook and "ok" or ("FAILED " .. tostring(repHookErr))) .. "\n")
@@ -1332,21 +1339,24 @@ RegisterKeyBind(Key.F9, guarded("F9", function()
         end
         print("[Palws] force-sync enabled; observing OnRep_Parameter for 5s\n")
 
-        ExecuteWithDelay(5000, guarded("force-sync-finish", function()
-            local okDisable, disableErr = pcall(function()
-                if isValid(playerState) then
-                    playerState:RequestForceSyncPalBoxSlot_ToServer(false)
-                end
-            end)
-            forceSyncExperiment.active = false
-            print(string.format(
-                "[Palws] force-sync result: callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s disable=%s\n",
-                forceSyncExperiment.callbacks,
-                countTable(forceSyncExperiment.uniqueSlots),
-                countTable(forceSyncExperiment.pages),
-                tostring(forceSyncExperiment.minSlot),
-                tostring(forceSyncExperiment.maxSlot),
-                okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
+        ExecuteWithDelay(5000, guarded("force-sync-finish-delay", function()
+            ExecuteInGameThread(guarded("force-sync-finish", function()
+                local okDisable, disableErr = pcall(function()
+                    if isValid(playerState) then
+                        playerState:RequestForceSyncPalBoxSlot_ToServer(false)
+                    end
+                end)
+                forceSyncExperiment.active = false
+                print(string.format(
+                    "[Palws] force-sync result: callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s callbackErrors=%d disable=%s\n",
+                    forceSyncExperiment.callbacks,
+                    countTable(forceSyncExperiment.uniqueSlots),
+                    countTable(forceSyncExperiment.pages),
+                    tostring(forceSyncExperiment.minSlot),
+                    tostring(forceSyncExperiment.maxSlot),
+                    forceSyncExperiment.callbackErrors,
+                    okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
+            end))
         end))
     end))
 end))
