@@ -613,11 +613,22 @@ local function dumpContainerPals(container, cidx)
     local limit = math.min(n, MAX_DUMP_PALS)
     for i = 0, limit - 1 do
         local okSlot, slot = pcall(function() return container:Get(i) end)
+        if i == 0 then
+            print("[Palws]   dbg i=0: okSlot=" .. tostring(okSlot) .. " slotValid=" .. tostring(isValid(slot))
+                .. " slotType=" .. type(slot) .. "\n")
+        end
         if okSlot and isValid(slot) then
             local param = slotParam(slot)
+            if i == 0 then
+                print("[Palws]   dbg i=0: paramValid=" .. tostring(isValid(param))
+                    .. " paramType=" .. type(param) .. "\n")
+            end
             -- verbose for the first 3 non-empty slots (field-level detail)
             local verbose = isValid(param) and #pals < 3
             local pj = buildPalJson(param, i, verbose)
+            if i == 0 then
+                print("[Palws]   dbg i=0: pj=" .. tostring(pj ~= nil) .. "\n")
+            end
             if pj then
                 -- tag each pal with its container index + group (party/box/base)
                 pj = pj:sub(1, 1) .. '"container":' .. cidx .. ',"group":"' .. group .. '",' .. pj:sub(2)
@@ -1289,19 +1300,14 @@ RegisterKeyBind(Key.F5, guarded("F5", function()
         -- on the 960-slot box container: how many slots actually resolve?
         if okC and type(cons) == "table" then
             for _, c in ipairs(cons) do
-                local num = tryCall(c, "Num")
-                if type(num) == "number" and math.floor(num) == 960 then
-                    local validSlots = 0
-                    for i = 0, 959 do
-                        local okS, s = pcall(function() return c:Get(i) end)
-                        if okS and isValid(s) then validSlots = validSlots + 1 end
-                    end
-                    print("[Palws] F5: box960 Get(i) valid slots=" .. validSlots .. "/960\n")
-                    break
-                end
             end
         end
         walkImages()
+        -- on the 960-slot box container: how many slots actually resolve?
+        if okC and type(cons) == "table" then
+            for _, c in ipairs(cons) do
+            end
+        end
         census()
     end))
 end))
