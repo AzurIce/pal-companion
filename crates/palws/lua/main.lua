@@ -707,9 +707,37 @@ local function dumpAll(reason)
         local okM, m = pcall(function() return boxUI:GetBoxMaxPageNum() end)
         okMax, maxPage = okM, (okM and type(m) == "number") and m or 1
     end
-    -- TEMP: page-turning disabled while diagnosing the 0-pals issue.
-    -- collect the containers we have (current page only) + i=0 dbg output.
+    -- PalBox slots beyond page 1 are lazily materialized: turn pages and
+    -- collect each page's slots IN ONE SYNCHRONOUS SWEEP (game renders only
+    -- the final state, so no visible page-flipping).
+    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
+    local boxUI = nil
+    if okU and type(uis) == "table" then
+        for _, ui in ipairs(uis) do
+            local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
+            if okN and type(n) == "number" and n > 1 then boxUI = ui break end
+        end
+    end
+    local maxPage = 1
+    if boxUI ~= nil then
+        local okM, m = pcall(function() return boxUI:GetBoxMaxPageNum() end)
+        if okM and type(m) == "number" then maxPage = m end
+    end
+    local t0 = os.clock()
     for _, c in ipairs(containers) do collect(c) end
+    for page = 2, maxPage do
+        if boxUI == nil or not isValid(boxUI) then break end
+        local okP = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
+        if not okP then break end
+        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+        if okC and type(cons) == "table" then
+            for _, c in ipairs(cons) do
+                if isValid(c) then collect(c) end
+            end
+        end
+    end
+    if boxUI ~= nil then pcall(function() boxUI:SetPagePalBoxList(0) end) end
+    print(string.format("[Palws] dumpAll sweep: %d pages in %.3fs\n", maxPage, os.clock() - t0))
     finish()
 end
 
