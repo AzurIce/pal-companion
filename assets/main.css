@@ -207,9 +207,10 @@ footer.attribution { flex: none; }
     padding: 1px 4px;
     pointer-events: none;
 }
-.avatar-badge--boss { top: -5px; left: -5px; background: #7c3aed; color: #fff; box-shadow: 0 0 0 2px var(--card); }
-.avatar-badge--lucky { top: -5px; right: -5px; background: #f59e0b; color: #fff; box-shadow: 0 0 0 2px var(--card); }
-.avatar-badge--fav { bottom: -5px; right: -5px; background: var(--muted); color: var(--foreground); box-shadow: 0 0 0 2px var(--card); }
+.avatar-badge--boss, .avatar-badge--lucky { top: -5px; left: -5px; }
+.avatar-badge--boss { background: #7c3aed; color: #fff; box-shadow: 0 0 0 2px var(--card); }
+.avatar-badge--lucky { background: #f59e0b; color: #fff; box-shadow: 0 0 0 2px var(--card); }
+.avatar-badge--fav { top: -5px; right: -5px; background: var(--muted); color: var(--foreground); box-shadow: 0 0 0 2px var(--card); }
 .owned-item-nick { color: var(--foreground); }
 .owned-item-nick + .species-sub { margin-left: 0; }
 

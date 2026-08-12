@@ -344,11 +344,11 @@ pub fn OwnedSidebar() -> Element {
                                     },
                                     div { class: "owned-avatar",
                                         img { src: icon_url(&pal.species), alt: "{sp.name_zh}" }
-                                        if pal.is_boss {
-                                            span { class: "avatar-badge avatar-badge--boss", "👑" }
-                                        }
+                                        // lucky 必然是头领形态，左上角只显示其一：闪光优先，否则头领
                                         if pal.is_lucky {
                                             span { class: "avatar-badge avatar-badge--lucky", "✨" }
+                                        } else if pal.is_boss {
+                                            span { class: "avatar-badge avatar-badge--boss", "👑" }
                                         }
                                         if pal.favorite > 0 {
                                             span { class: "avatar-badge avatar-badge--fav", "{fav_label}" }

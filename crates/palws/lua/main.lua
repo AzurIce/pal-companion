@@ -303,18 +303,33 @@ end
 
 local function readNickname(param)
     if not READ_NICKNAME then return nil end
-    -- struct member read (FString is not enum; read may be safe) — xpcall'd
+    -- struct member read: FString props may come back wrapped (RemoteUnrealParam)
+    -- on the experimental build; unwrap + tostring, then filter garbage.
+    local function s2str(v)
+        if v == nil then return nil end
+        if type(v) == "string" then return v end
+        local s = fnameToString(unwrap(v))
+        if s and s ~= "" and not looksLikeObjectDump(s) then return s end
+        return nil
+    end
     local sp = safeProp(param, "SaveParameter", "struct")
     if sp ~= nil then
         local tb = (type(debug) == "table" and debug.traceback) and debug.traceback
             or function(e) return tostring(e) end
-        local ok, nn = xpcall(function() return safeStructProp(sp, "NickName", "string") end, tb)
-        if ok and type(nn) == "string" and nn ~= "" then return nn end
-        local ok2, fn = xpcall(function() return safeStructProp(sp, "FilteredNickName", "string") end, tb)
-        if ok2 and type(fn) == "string" and fn ~= "" then return fn end
+        local ok, nn = xpcall(function() return safeStructProp(sp, "NickName", "any") end, tb)
+        if ok then
+            local s = s2str(nn)
+            if s then return s end
+        end
+        local ok2, fn = xpcall(function() return safeStructProp(sp, "FilteredNickName", "any") end, tb)
+        if ok2 then
+            local s = s2str(fn)
+            if s then return s end
+        end
     end
     local v = safeCall(param, "GetNickname")
-    if type(v) == "string" and v ~= "" and not looksLikeObjectDump(v) then return v end
+    local s = s2str(v)
+    if s then return s end
     return nil
 end
 
