@@ -1,0 +1,30 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 406c477..29c4682 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -50,0 +51,19 @@ impl From<&str> for NodeId {
++/// Node content renderer whose identity participates in props equality.
++/// Dioxus updates Callback/EventHandler targets in place, which is useful for
++/// event handlers but can leave node content stale when the closure captures
++/// new render state. A fresh Rc has a fresh identity and triggers rerendering.
++#[derive(Clone)]
++pub struct RenderNode(pub Rc<dyn Fn(NodeId) -> Element>);
++impl PartialEq for RenderNode {
++    fn eq(&self, other: &Self) -> bool {
++        Rc::ptr_eq(&self.0, &other.0)
++    }
++}
++impl RenderNode {
++    pub fn new(f: impl Fn(NodeId) -> Element + 'static) -> Self {
++        Self(Rc::new(f))
++    }
++    fn call(&self, id: NodeId) -> Element {
++        (self.0)(id)
++    }
++}
+@@ -388 +407 @@ pub fn FlowCanvas(
+-    render_node: Callback<NodeId, Element>,
++    render_node: RenderNode,
+@@ -582 +601 @@ fn FlowScene(
+-    render_node: Callback<NodeId, Element>,
++    render_node: RenderNode,
