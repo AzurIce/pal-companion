@@ -741,6 +741,33 @@ function wakeBoxPages()
     return maxPage
 end
 
+local function walkImages()
+    -- dump every Image widget's brush texture path (locate boss/lucky/favorite icons)
+    local ok, imgs = pcall(function() return FindAllOf("Image") end)
+    if not (ok and type(imgs) == "table") then
+        print("[Palws] walkImages: FindAllOf Image failed\n")
+        return
+    end
+    print("[Palws] walkImages: " .. #imgs .. " images\n")
+    local seen = {}
+    local n = 0
+    for _, img in ipairs(imgs) do
+        local okB, brush = pcall(function() return img.Brush end)
+        if okB and brush ~= nil then
+            local okR, ro = pcall(function() return brush.ResourceObject end)
+            if okR and isValid(ro) then
+                local okF, full = pcall(function() return ro:GetFullName() end)
+                if okF and type(full) == "string" and not seen[full] then
+                    seen[full] = true
+                    n = n + 1
+                    print("[Palws]   img brush: " .. full .. "\n")
+                end
+            end
+        end
+    end
+    print("[Palws] walkImages done (" .. n .. " unique)\n")
+end
+
 -- ---------- deep diagnostics (F5) ----------
 local function walkObjectProps(obj, label)
     print("[Palws] step: property walk of " .. label .. "\n")
@@ -1224,8 +1251,7 @@ RegisterKeyBind(Key.F5, guarded("F5", function()
         if okS and isValid(sub) then walkObjectProps(sub, "PalGlobalPalStorageSubsystem") end
         -- box paging diagnostics: how many UI models, page counts, containers
         local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
-        print("[Palws] F5: PalUIPalBoxBase count=" .. tostring(okU and #uis or "err") .. "\n")
-        if okU then
+        print("[Palws] F5: PalUIPalBoxBase count=" .. tostring(okU and #uis or "err") .. "\n")        if okU then
             for _, ui in ipairs(uis) do
                 local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
                 print("[Palws]   boxUI addr=" .. tostring(ui:GetAddress())
@@ -1275,6 +1301,7 @@ RegisterKeyBind(Key.F5, guarded("F5", function()
                 end
             end
         end
+        walkImages()
         census()
     end))
 end))
