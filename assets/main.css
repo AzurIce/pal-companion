@@ -226,8 +226,11 @@ footer.attribution { flex: none; }
 .owned-avatar > img.avatar-badge-img--fav {
     left: auto;
     right: -6px;
-    /* 原纹理为白色，游戏通过 UMG Brush Tint 着成黄色。 */
-    filter: sepia(1) saturate(8) hue-rotate(350deg) brightness(1.15);
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+    /* PNG 已按游戏 Brush Tint 主色 #FFE121 预着色，保持原始 alpha。 */
+    filter: none;
 }
 .owned-item-nick { color: var(--foreground); }
 .owned-item-nick + .species-sub { margin-left: 0; }
