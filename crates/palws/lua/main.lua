@@ -376,37 +376,43 @@ end
 
 local function readPassives(param)
     if not READ_PASSIVES then return nil end
-    -- function entry first (kit: UFUNCTION TArray<FName> GetPassiveSkillList);
-    -- struct array member as fallback (array != enum, may be safe)
+    local tb = (type(debug) == "table" and debug.traceback) and debug.traceback
+        or function(e) return tostring(e) end
+    -- 属性优先：sp.PassiveSkillList 数组元素是 FNameUserdata，:ToString() 直接可用
+    -- （introspect 实证：GetPassiveSkillList 函数返回 RemoteUnrealParam 包装难解）
+    local function collect(list)
+        if type(list) ~= "table" then return nil end
+        local okN, n = pcall(function() return #list end)
+        if not okN or type(n) ~= "number" or n <= 0 then return nil end
+        local out = {}
+        for i = 1, math.min(n, 16) do
+            local okE, e = pcall(function() return list[i] end)
+            if okE and e ~= nil then
+                local s = fnameToString(e)
+                if (s == nil or looksLikeObjectDump(s)) and type(e) == "userdata" then
+                    s = fnameToString(unwrap(e))
+                end
+                if s and s ~= "" and s ~= "None" and not looksLikeObjectDump(s) then
+                    out[#out + 1] = s
+                end
+            end
+        end
+        return out
+    end
+    local sp = safeProp(param, "SaveParameter", "struct")
+    if sp ~= nil then
+        local ok, l2 = xpcall(function() return safeStructProp(sp, "PassiveSkillList", "any") end, tb)
+        if ok then
+            local r = collect(l2)
+            if r and #r > 0 then return r end
+        end
+    end
+    -- 函数兑底：GetPassiveSkillList（RemoteUnrealParam 包装，需 unwrap）
     local list = safeCall(param, "GetPassiveSkillList")
-    if list == nil then
-        local sp = safeProp(param, "SaveParameter", "struct")
-        if sp ~= nil then
-            local ok, l2 = xpcall(function() return safeStructProp(sp, "PassiveSkillList", "any") end,
-                function(e) return tostring(e) end)
-            if ok then list = l2 end
-        end
-    end
     if list == nil then return nil end
-    if list == nil then return nil end
-    local okN, n = pcall(function() return #list end)
-    if not okN or type(n) ~= "number" or n <= 0 then return nil end
-    local out = {}
-    for i = 1, math.min(n, 16) do
-        local okE, e = pcall(function() return list[i] end)
-        if okE and e ~= nil then
-            -- element is FName per kit (TArray<FName>): try direct ToString
-            -- first; only if it is a wrapper do a guarded unwrap
-            local s = fnameToString(e)
-            if (s == nil or looksLikeObjectDump(s)) and type(e) == "userdata" then
-                s = fnameToString(unwrap(e))
-            end
-            if s and s ~= "" and s ~= "None" and not looksLikeObjectDump(s) then
-                out[#out + 1] = s
-            end
-        end
-    end
-    return out
+    local r = collect(list)
+    if r and #r > 0 then return r end
+    return nil
 end
 
 -- ---------- pal json ----------
@@ -1180,7 +1186,8 @@ RegisterKeyBind(Key.F3, guarded("F3", function()
 end))
 
 RegisterKeyBind(Key.F4, guarded("F4", function()
-    ExecuteInGameThread(guarded("memmap", function()
+    ExecuteInGameThread(guarded("introspect", function()
+        pcall(introspectFirstPal)
         pcall(memmapFirstPal)
     end))
 end))
