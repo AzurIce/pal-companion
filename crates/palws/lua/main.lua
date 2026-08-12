@@ -607,12 +607,12 @@ local function dumpContainerPals(container, cidx)
     local group = "base"
     if n == 5 then group = "party" elseif n == 960 then group = "box" end
     local pals = {}
-    -- iterate the GetSlots() array directly (pure Lua, zero per-slot UE4SS
-    -- reflection calls). container:Get(i) ×960 was the pure-virtual crash
-    -- source (GIsRunning==1); slots[i] is a plain array read.
+    -- Get(i) is the only way to obtain valid slot refs (GetSlots() array
+    -- elements are opaque wrappers -> 0 pals). Keep per-slot Get(i) but with
+    -- a small inter-slot yield to avoid a heavy single-frame burst.
     local limit = math.min(n, MAX_DUMP_PALS)
-    for i = 1, limit do
-        local okSlot, slot = pcall(function() return slots[i] end)
+    for i = 0, limit - 1 do
+        local okSlot, slot = pcall(function() return container:Get(i) end)
         if okSlot and isValid(slot) then
             local param = slotParam(slot)
             -- verbose for the first 3 non-empty slots (field-level detail)
@@ -675,15 +675,42 @@ local function dumpAll(reason)
         end
         return false
     end
-    -- collect every container directly. GetSlots() arrays are read with pure
-    -- Lua (no per-slot reflection); if the box array already holds all pal
-    -- slots in memory, NO page turns are needed at all.
-    for _, c in ipairs(containers) do collect(c) end
+    -- PalBox slots beyond page 1 are lazily materialized: turn pages and
+    -- collect each page's slots IN ONE SYNCHRONOUS SWEEP (no async spreading —
+    -- the game renders only the final state, so no visible page-flipping).
     local function finish()
         broadcastJson('{"version":1,"source":"palws","event":"' .. reason
             .. '","pals":[' .. table.concat(all, ",") .. "]}")
         print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
     end
+    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
+    local boxUI = nil
+    if okU and type(uis) == "table" then
+        for _, ui in ipairs(uis) do
+            local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
+            if okN and type(n) == "number" and n > 1 then boxUI = ui break end
+        end
+    end
+    local okMax, maxPage = 0, 1
+    if boxUI ~= nil then
+        local okM, m = pcall(function() return boxUI:GetBoxMaxPageNum() end)
+        okMax, maxPage = okM, (okM and type(m) == "number") and m or 1
+    end
+    local t0 = os.clock()
+    for _, c in ipairs(containers) do collect(c) end
+    for page = 2, maxPage do
+        if boxUI == nil or not isValid(boxUI) then break end
+        local okP = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
+        if not okP then break end
+        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+        if okC and type(cons) == "table" then
+            for _, c in ipairs(cons) do
+                if isValid(c) then collect(c) end
+            end
+        end
+    end
+    if boxUI ~= nil then pcall(function() boxUI:SetPagePalBoxList(0) end) end
+    print(string.format("[Palws] dumpAll sweep: %d pages in %.3fs\n", maxPage, os.clock() - t0))
     finish()
 end
 
