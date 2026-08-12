@@ -744,7 +744,7 @@ local function dumpAll(reason)
     end
     for page = 2, maxPage do
         if boxUI == nil or not isValid(boxUI) then break end
-        local okP = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
+        local okP = pcall(function() boxUI:SetPagePalBoxList(page - 1) end)
         if not okP then break end
         local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
         if okC and type(cons) == "table" then
