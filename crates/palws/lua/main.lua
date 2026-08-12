@@ -605,7 +605,11 @@ local function dumpContainerPals(container, cidx)
     end
     -- group by container size: 5=party, 960=palbox, else=base facility
     local group = "base"
-    if n == 5 then group = "party" elseif n == 960 then group = "box" end
+    -- 5 = party, 960 = palbox master, 30 = palbox PAGE container (created as
+    -- the user browses pages; holds that page's real slots)
+    if n == 5 then group = "party"
+    elseif n == 960 or n == 30 then group = "box"
+    end
     local pals = {}
     -- Get(i) is the only way to obtain valid slot refs (GetSlots() array
     -- elements are opaque wrappers -> 0 pals). Keep per-slot Get(i) but with
@@ -654,13 +658,82 @@ end
 local dumping = false
 local pendingDump = false
 
+local globalPals = {}   -- palbox+party+base aggregated, key = species|gender|level
+
+local function countTable(t)
+    local n = 0
+    for _ in pairs(t) do n = n + 1 end
+    return n
+end
+
+local function addPalGlobal(pj)
+    local key = (pj:match('"species":"([^"]*)"') or "?")
+        .. "|" .. (pj:match('"gender":"([^"]*)"') or "?")
+        .. "|" .. (pj:match('"level":(%d+)') or "?")
+    globalPals[key] = pj
+end
+
+local function broadcastGlobal(reason)
+    local arr = {}
+    for _, pj in pairs(globalPals) do arr[#arr + 1] = pj end
+    broadcastJson('{"version":1,"source":"palws","event":"' .. reason
+        .. '","pals":[' .. table.concat(arr, ",") .. "]}")
+end
+
+local dumping = false
+local pendingDump = false
+
 local function dumpAll(reason)
     if dumping then
         pendingDump = true
-        print("[Palws] dumpAll reentrant, queued (" .. reason .. ")
-")
         return
     end
+    dumping = true
+    baseCampSeq = 0
+    print("[Palws] dumpAll enter (" .. reason .. ")
+")
+    local containers = getContainers()
+    if #containers == 0 then
+        print("[Palws] dumpAll exit: no containers
+")
+        dumping = false
+        return
+    end
+    local t0 = os.clock()
+    local collected = 0
+    for _, c in ipairs(containers) do
+        if isValid(c) then
+            -- 30-slot containers are palbox PAGE containers (handled by the
+            -- page-turn hook's SlotList). 960 master box is collected here for
+            -- the current page; the hook adds the rest as the user browses.
+            local num = tryCall(c, "Num")
+            local n = type(num) == "number" and math.floor(num) or -1
+            if n ~= 30 then
+                local okC, res = pcall(dumpContainerPals, c, collected)
+                if okC and type(res) == "table" then
+                    for _, pj in ipairs(res) do
+                        addPalGlobal(pj)
+                        collected = collected + 1
+                    end
+                elseif not okC then
+                    print("[Palws] container dump ERROR: " .. tostring(res) .. "
+")
+                end
+            end
+        end
+    end
+    print(string.format("[Palws] dumpAll: %d party/base pals in %.3fs
+",
+        collected, os.clock() - t0))
+    broadcastGlobal(reason)
+    print("[Palws] dumpAll exit ok, global total " .. countTable(globalPals) .. " pals
+")
+    dumping = false
+    if pendingDump then
+        pendingDump = false
+        ExecuteWithDelay(200, function() dumpAll("queued") end)
+    end
+end
     dumping = true
     baseCampSeq = 0
     print("[Palws] dumpAll enter (" .. reason .. ")
@@ -1369,10 +1442,33 @@ print("[Palws] loaded. F5=deep-diag F6=capture F7=dump F8=fake\n")
 -- page turning, no Get(i) storm, no crash.
 local okHook, hookErr = pcall(function()
     RegisterHook("/Script/Pal.PalUIPalBoxBase:OnUpdatePagePalBoxList",
-        guarded("palbox-page", function()
-            if not dumping then
-                ExecuteWithDelay(150, function() dumpAll("page-turn") end)
-            end
+        guarded("palbox-page", function(_, NowPage, SlotList)
+            -- collect THIS page's slots directly (the game hands us valid
+            -- refs — no Get(i) storm). Deferred so we don't work inside hook
+            -- dispatch; dedup happens via globalPals.
+            ExecuteWithDelay(120, function()
+                if type(SlotList) ~= "table" then return end
+                local added = 0
+                for i, slot in ipairs(SlotList) do
+                    if isValid(slot) then
+                        local param = slotParam(slot)
+                        if isValid(param) then
+                            local pj = buildPalJson(param, i, false)
+                            if pj then
+                                pj = pj:sub(1, 1) .. '"group":"box",' .. pj:sub(2)
+                                local key = (pj:match('"species":"([^"]*)"') or "?")
+                                    .. "|" .. (pj:match('"gender":"([^"]*)"') or "?")
+                                    .. "|" .. (pj:match('"level":(%d+)') or "?")
+                                if not globalPals[key] then added = added + 1 end
+                                globalPals[key] = pj
+                            end
+                        end
+                    end
+                end
+                if added > 0 or countTable(globalPals) > 0 then
+                    broadcastGlobal("page-turn")
+                end
+            end)
         end))
 end)
 print("[Palws] OnUpdatePagePalBoxList hook: " .. (okHook and "ok" or ("FAILED " .. tostring(hookErr))) .. "\n")
