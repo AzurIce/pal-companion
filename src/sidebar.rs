@@ -532,7 +532,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                         }
                         .to_string(),
                     );
-                    boss_lucky.set(if p.is_boss { "boss" } else if p.is_lucky { "lucky" } else { "none" });
+                    boss_lucky.set(if p.is_boss { "boss" } else if p.is_lucky { "lucky" } else { "none" }.to_string());
                     favorite.set(p.favorite.min(3).to_string());
                     nickname.set(p.nickname.clone().unwrap_or_default());
                     for (i, mut s) in slots.into_iter().enumerate() {
@@ -542,7 +542,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                 None => {
                     species.set(None);
                     gender.set("male".to_string());
-                    boss_lucky.set("none");
+                    boss_lucky.set("none".to_string());
                     favorite.set("0".to_string());
                     nickname.set(String::new());
                     for mut s in slots {

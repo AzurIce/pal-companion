@@ -920,13 +920,23 @@ local function probeActive(w)
     return nil, nil
 end
 
+local TERMINAL_CLASSES = {
+    "WBP_PalStorageMenu_C",      -- storage terminal / palbox at base
+    "WBP_IngameMenu_PalBox_C",  -- ingame menu -> pals (palbox page)
+    "WBP_PalBox_C",             -- direct palbox widget (fallback)
+}
+
 local function pollTerminal()
-    local ok, obj = pcall(function() return FindFirstOf("WBP_PalStorageMenu_C") end)
-    if not (ok and isValid(obj)) then
+    local obj = nil
+    for _, cls in ipairs(TERMINAL_CLASSES) do
+        local ok, o = pcall(function() return FindFirstOf(cls) end)
+        if ok and isValid(o) then obj = o break end
+    end
+    if obj == nil then
         if terminalActive then terminalActive = false end
         if not pollNoteLogged then
             pollNoteLogged = true
-            print("[Palws] poll: WBP_PalStorageMenu_C not found (yet)\n")
+            print("[Palws] poll: no terminal widget found (yet)\n")
         end
         return
     end
