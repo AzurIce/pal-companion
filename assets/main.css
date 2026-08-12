@@ -199,29 +199,22 @@ footer.attribution { flex: none; }
     background: var(--muted);
     display: block;
 }
-.avatar-badge {
-    position: absolute;
-    font-size: 10px;
-    line-height: 1.2;
-    border-radius: 999px;
-    padding: 1px 4px;
-    pointer-events: none;
-}
-.avatar-badge--boss, .avatar-badge--lucky { top: -5px; left: -5px; }
-.avatar-badge--boss { background: #7c3aed; color: #fff; box-shadow: 0 0 0 2px var(--card); }
-.avatar-badge--lucky { background: #f59e0b; color: #fff; box-shadow: 0 0 0 2px var(--card); }
-/* 游戏闪光/最爱图标；提高选择器优先级，避免被头像的 40×40 规则覆盖。 */
+/* 游戏头领/闪光/最爱图标；提高选择器优先级，避免被头像的 40×40 规则覆盖。 */
 .owned-avatar > img.avatar-badge-img {
     position: absolute;
     top: -6px;
     left: -6px;
     width: 20px;
     height: 20px;
-    border-radius: 6px;
-    box-shadow: 0 0 0 2px var(--card);
-    background: var(--card);
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
     object-fit: contain;
     pointer-events: none;
+}
+.owned-avatar > img.avatar-badge-img--boss {
+    /* 原游戏资源为 64×64；20×20 与头像中的游戏缩放比例一致。 */
+    image-rendering: auto;
 }
 .owned-avatar > img.avatar-badge-img--fav {
     left: auto;

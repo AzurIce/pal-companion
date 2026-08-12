@@ -348,9 +348,19 @@ pub fn OwnedSidebar() -> Element {
                                         img { src: icon_url(&pal.species), alt: "{sp.name_zh}" }
                                         // lucky 必然是头领形态，左上角只显示其一：闪光图标优先，否则头领
                                         if pal.is_lucky {
-                                            img { class: "avatar-badge-img", src: "icons/rare.png", alt: "闪光" }
+                                            img {
+                                                class: "avatar-badge-img avatar-badge-img--lucky",
+                                                src: "icons/rare.png",
+                                                alt: "闪光",
+                                                title: "闪光",
+                                            }
                                         } else if pal.is_boss {
-                                            span { class: "avatar-badge avatar-badge--boss", "👑" }
+                                            img {
+                                                class: "avatar-badge-img avatar-badge-img--boss",
+                                                src: "icons/boss.png",
+                                                alt: "头领",
+                                                title: "头领",
+                                            }
                                         }
                                         if favorite > 0 {
                                             img {
