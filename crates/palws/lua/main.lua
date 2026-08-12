@@ -13,7 +13,7 @@
 
 -- field switches for crash bisecting: off = never invoked, outputs default
 local READ_PASSIVES = false  -- PRIME SUSPECT (FName array elements); default OFF
-local READ_GENDER   = false  -- BISECT RESULT: enum return AVs; memory path replaces it
+local READ_GENDER   = true   -- RE-VERIFY on UE4SS Experimental (Palworld): UEnum::Names 0x48 layout
 local READ_NICKNAME = true   -- struct FString member, suspected safe
 local MAX_DUMP_PALS = 600
 
