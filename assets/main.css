@@ -190,6 +190,29 @@ footer.attribution { flex: none; }
     flex: none;
 }
 
+/* 头像角标：头领（左上） / 幸运（右上） / 最爱 I·II·III（右下） */
+.owned-avatar { position: relative; flex: none; }
+.owned-avatar img {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
+    background: var(--muted);
+    display: block;
+}
+.avatar-badge {
+    position: absolute;
+    font-size: 10px;
+    line-height: 1.2;
+    border-radius: 999px;
+    padding: 1px 4px;
+    pointer-events: none;
+}
+.avatar-badge--boss { top: -5px; left: -5px; background: #7c3aed; color: #fff; box-shadow: 0 0 0 2px var(--card); }
+.avatar-badge--lucky { top: -5px; right: -5px; background: #f59e0b; color: #fff; box-shadow: 0 0 0 2px var(--card); }
+.avatar-badge--fav { bottom: -5px; right: -5px; background: var(--muted); color: var(--foreground); box-shadow: 0 0 0 2px var(--card); }
+.owned-item-nick { color: var(--foreground); }
+.owned-item-nick + .species-sub { margin-left: 0; }
+
 .owned-item-main { min-width: 0; flex: 1; }
 
 .owned-item-name {

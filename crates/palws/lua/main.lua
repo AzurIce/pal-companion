@@ -259,17 +259,23 @@ local function unwrap(v)
     -- only genuine wrappers: userdata that exposes a callable .get
     -- (a RemoteUnrealParam wrapping a PRIMITIVE may AV inside :get();
     -- callers must only unwrap values known to wrap names/objects)
-    if type(v) ~= "userdata" then return v end
-    local okG, g = pcall(function() return v.get end)
-    if not okG or type(g) ~= "function" then return v end
-    local ok, inner = pcall(function() return v:get() end)
-    if ok and inner ~= nil then return inner end
-    return v
+    -- iterate: wrappers can nest (RemoteUnrealParam > RemoteUnrealParam > FName)
+    local cur = v
+    for _ = 1, 4 do
+        if type(cur) ~= "userdata" then return cur end
+        local okG, g = pcall(function() return cur.get end)
+        if not okG or type(g) ~= "function" then return cur end
+        local ok, inner = pcall(function() return cur:get() end)
+        if not (ok and inner ~= nil) then return cur end
+        cur = inner
+    end
+    return cur
 end
 
 -- ---------- field readers ----------
 local function looksLikeObjectDump(s)
-    return s ~= nil and (s:find("^UObject:") or s:find("^UFunction:") or s:find("^Property"))
+    return s ~= nil and (s:find("^UObject:") or s:find("^UFunction:") or s:find("^Property")
+        or s:find("^RemoteUnrealParam:"))
 end
 
 local function mapGenderNumber(n)

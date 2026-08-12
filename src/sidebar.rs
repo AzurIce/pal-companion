@@ -333,6 +333,7 @@ pub fn OwnedSidebar() -> Element {
                                 Gender::Female => "female",
                             };
                             let p = pal.clone();
+                            let fav_label = ["", "I", "II", "III"][pal.favorite.min(3) as usize].to_string();
                             rsx! {
                                 button {
                                     key: "{pal.id}",
@@ -341,24 +342,26 @@ pub fn OwnedSidebar() -> Element {
                                         editing.set(Some(p.clone()));
                                         dialog_open.set(true);
                                     },
-                                    img { src: icon_url(&pal.species), alt: "{sp.name_zh}" }
+                                    div { class: "owned-avatar",
+                                        img { src: icon_url(&pal.species), alt: "{sp.name_zh}" }
+                                        if pal.is_boss {
+                                            span { class: "avatar-badge avatar-badge--boss", "👑" }
+                                        }
+                                        if pal.is_lucky {
+                                            span { class: "avatar-badge avatar-badge--lucky", "✨" }
+                                        }
+                                        if pal.favorite > 0 {
+                                            span { class: "avatar-badge avatar-badge--fav", "{fav_label}" }
+                                        }
+                                    }
                                     div { class: "owned-item-main",
                                         div { class: "owned-item-name",
                                             span { class: "dex-no", "#{sp.paldex_no}" }
                                             if let Some(nick) = &pal.nickname {
-                                                "{nick}"
+                                                span { class: "owned-item-nick", "{nick}" }
                                                 span { class: "species-sub", "{sp.name_zh}" }
                                             } else {
                                                 "{sp.name_zh}"
-                                            }
-                                            if pal.is_boss {
-                                                span { class: "boss-tag", "头领" }
-                                            }
-                                            if pal.is_lucky {
-                                                span { class: "lucky-tag", "幸运" }
-                                            }
-                                            if pal.favorite > 0 {
-                                                span { class: "fav-tag", "{[\"\", \"I\", \"II\", \"III\"][pal.favorite.min(3) as usize]}" }
                                             }
                                             span { class: "gender-tag {gender_class}", "{pal.gender.symbol()}" }
                                         }
