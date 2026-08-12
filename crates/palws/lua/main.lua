@@ -618,18 +618,68 @@ local function dumpAll(reason)
 
     -- aggregate every container into ONE message so the app's pending
     -- list is never overwritten by rapid successive broadcasts
+    local seen = {}   -- container address -> true (dedup across page turns)
     local all = {}
-    for i, c in ipairs(containers) do
-        local okC, res = pcall(dumpContainerPals, c, i - 1)
+    local cidx = -1
+    local function collect(container)
+        local addr = container:GetAddress()
+        if seen[addr] then return false end
+        seen[addr] = true
+        cidx = cidx + 1
+        local okC, res = pcall(dumpContainerPals, container, cidx)
         if okC and type(res) == "table" then
             for _, pj in ipairs(res) do all[#all + 1] = pj end
+            return true
         elseif not okC then
-            print("[Palws] container " .. (i - 1) .. " dump ERROR: " .. tostring(res) .. "\n")
+            print("[Palws] container " .. cidx .. " dump ERROR: " .. tostring(res) .. "\n")
         end
+        return false
     end
+    for _, c in ipairs(containers) do collect(c) end
+    -- PalBox pages beyond page 1 are lazily-loaded containers: turn pages on
+    -- the box UI and collect any new containers that materialize.
+    local extra = dumpAllPages(collect)
     broadcastJson('{"version":1,"source":"palws","event":"' .. reason
         .. '","pals":[' .. table.concat(all, ",") .. "]}")
-    print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
+    print("[Palws] dumpAll exit ok, total " .. #all .. " pals (box pages +" .. extra .. ")\n")
+end
+
+-- PalBox is paged (30 slots/page, up to 32 pages = 960). Only the current
+-- page's container is materialized; other pages are loaded lazily via UI page
+-- turns. Find the box UI (maxPage > 1), turn every page, and collect any
+-- newly-appeared PalIndividualCharacterContainer through `collect`.
+local function dumpAllPages(collect)
+    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
+    if not (okU and type(uis) == "table") then return 0 end
+    local boxUI = nil
+    for _, ui in ipairs(uis) do
+        local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
+        if okN and type(n) == "number" and n > 1 then boxUI = ui break end
+    end
+    if boxUI == nil then return 0 end
+    local okMax, maxPage = pcall(function() return boxUI:GetBoxMaxPageNum() end)
+    if not okMax or type(maxPage) ~= "number" or maxPage <= 1 then return 0 end
+    local before = 0
+    local okB, cons0 = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+    if okB and type(cons0) == "table" then before = #cons0 end
+    local extra = 0
+    for page = 2, maxPage do
+        pcall(function() boxUI:ChangeNextPagePalBoxList() end)
+        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+        if okC and type(cons) == "table" then
+            for _, c in ipairs(cons) do
+                local okA, addr = pcall(function() return c:GetAddress() end)
+                if okA and collect(c) then extra = extra + 1 end
+            end
+        end
+    end
+    pcall(function() boxUI:SetPagePalBoxList(0) end)  -- back to page 1
+    local after = 0
+    local okA2, cons2 = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+    if okA2 and type(cons2) == "table" then after = #cons2 end
+    print(string.format("[Palws] dumpAllPages: maxPage=%d containers %d->%d\n",
+        maxPage, before, after))
+    return extra
 end
 
 -- ---------- deep diagnostics (F5) ----------
@@ -1114,6 +1164,37 @@ RegisterKeyBind(Key.F5, guarded("F5", function()
         if okM and isValid(mgr) then walkObjectProps(mgr, "PalCharacterContainerManager") end
         local okS, sub = pcall(function() return FindFirstOf("PalGlobalPalStorageSubsystem") end)
         if okS and isValid(sub) then walkObjectProps(sub, "PalGlobalPalStorageSubsystem") end
+        -- box paging diagnostics: how many UI models, page counts, containers
+        local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
+        print("[Palws] F5: PalUIPalBoxBase count=" .. tostring(okU and #uis or "err") .. "\n")
+        if okU then
+            for _, ui in ipairs(uis) do
+                local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
+                print("[Palws]   boxUI addr=" .. tostring(ui:GetAddress())
+                    .. " maxPage=" .. tostring(okN and n or "?"))
+            end
+        end
+        local okP, models = pcall(function() return FindAllOf("PalUIPalStorageModel") end)
+        print("[Palws] F5: PalUIPalStorageModel count=" .. tostring(okP and #models or "err") .. "\n")
+        if okP then
+            for _, m in ipairs(models) do
+                local okN, n = pcall(function() return m:GetWholePageCount() end)
+                local okT, tgt = pcall(function() return m:GetTargetContainerId() end)
+                print("[Palws]   model addr=" .. tostring(m:GetAddress())
+                    .. " wholePages=" .. tostring(okN and n or "?")
+                    .. " target=" .. tostring(okT and tostring(tgt) or "?"))
+            end
+        end
+        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+        print("[Palws] F5: containers=" .. tostring(okC and #cons or "err") .. "\n")
+        if okC then
+            for _, c in ipairs(cons) do
+                local num = tryCall(c, "Num")
+                local slots = tryCall(c, "GetSlots")
+                local n = slots and #slots or num
+                print("[Palws]   container addr=" .. tostring(c:GetAddress()) .. " n=" .. tostring(n))
+            end
+        end
         census()
     end))
 end))
