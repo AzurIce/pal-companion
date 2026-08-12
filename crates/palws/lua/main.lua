@@ -651,25 +651,36 @@ local function dumpContainerPals(container, cidx)
     return pals
 end
 
+local dumping = false
+local pendingDump = false
+
 local function dumpAll(reason)
-    baseCampSeq = 0
-    print("[Palws] dumpAll enter (" .. reason .. ")\n")
-    local containers = getContainers()
-    print("[Palws] containers found: " .. #containers .. "\n")
-    if #containers == 0 then
-        print("[Palws] dumpAll exit: no containers\n")
+    if dumping then
+        pendingDump = true
+        print("[Palws] dumpAll reentrant, queued (" .. reason .. ")
+")
         return
     end
-
+    dumping = true
+    baseCampSeq = 0
+    print("[Palws] dumpAll enter (" .. reason .. ")
+")
+    local containers = getContainers()
+    print("[Palws] containers found: " .. #containers .. "
+")
+    if #containers == 0 then
+        print("[Palws] dumpAll exit: no containers
+")
+        dumping = false
+        return
+    end
     for i, c in ipairs(containers) do
         local num, nslots, firstPal = containerSummary(c)
-        print(string.format("[Palws]   container %d: num=%s slots=%s first=%s\n",
+        print(string.format("[Palws]   container %d: num=%s slots=%s first=%s
+",
             i, tostring(num), tostring(nslots), tostring(firstPal)))
     end
-
-    -- aggregate every container into ONE message so the app's pending
-    -- list is never overwritten by rapid successive broadcasts
-    local seen = {}   -- container address -> true (dedup across page turns)
+    local seen = {}
     local all = {}
     local cidx = -1
     local function collect(container)
@@ -682,78 +693,27 @@ local function dumpAll(reason)
             for _, pj in ipairs(res) do all[#all + 1] = pj end
             return true
         elseif not okC then
-            print("[Palws] container " .. cidx .. " dump ERROR: " .. tostring(res) .. "\n")
+            print("[Palws] container " .. cidx .. " dump ERROR: " .. tostring(res) .. "
+")
         end
         return false
     end
-    -- PalBox slots beyond page 1 are lazily materialized: turn pages and
-    -- collect each page's slots IN ONE SYNCHRONOUS SWEEP (no async spreading —
-    -- the game renders only the final state, so no visible page-flipping).
-    local function finish()
-        broadcastJson('{"version":1,"source":"palws","event":"' .. reason
-            .. '","pals":[' .. table.concat(all, ",") .. "]}")
-        print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
-    end
-    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
-    local boxUI = nil
-    if okU and type(uis) == "table" then
-        for _, ui in ipairs(uis) do
-            local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
-            if okN and type(n) == "number" and n > 1 then boxUI = ui break end
-        end
-    end
-    local okMax, maxPage = 0, 1
-    if boxUI ~= nil then
-        local okM, m = pcall(function() return boxUI:GetBoxMaxPageNum() end)
-        okMax, maxPage = okM, (okM and type(m) == "number") and m or 1
-    end
-    -- PalBox slots beyond page 1 are lazily materialized: turn pages and
-    -- collect each page's slots IN ONE SYNCHRONOUS SWEEP (game renders only
-    -- the final state, so no visible page-flipping).
-    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
-    local boxUI = nil
-    if okU and type(uis) == "table" then
-        for _, ui in ipairs(uis) do
-            local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
-            if okN and type(n) == "number" and n > 1 then boxUI = ui break end
-        end
-    end
-    local maxPage = 1
-    if boxUI ~= nil then
-        local okM, m = pcall(function() return boxUI:GetBoxMaxPageNum() end)
-        if okM and type(m) == "number" then maxPage = m end
-    end
     local t0 = os.clock()
     for _, c in ipairs(containers) do collect(c) end
-    -- Page turns wake more slots on the SAME box container, so seen-dedup
-    -- would skip it. Force a re-dump per page and dedup at the pal level.
-    local seenPal = {}
-    local function collectDup(c)
-        if not isValid(c) then return end
-        local okD, res = pcall(dumpContainerPals, c, cidx + 1)
-        if okD and type(res) == "table" then
-            for _, pj in ipairs(res) do
-                if not seenPal[pj] then
-                    seenPal[pj] = true
-                    all[#all + 1] = pj
-                end
-            end
-        elseif not okD then
-            print("[Palws] page-dump ERROR: " .. tostring(res) .. "\n")
-        end
+    -- No programmatic page turning: it neither wakes slots nor is safe
+    -- (forced 960x Get(i) per page crashed). Slots wake only when the USER
+    -- browses pages; OnUpdatePagePalBoxList hook triggers re-dumps.
+    print(string.format("[Palws] dumpAll collect pass: %.3fs
+", os.clock() - t0))
+    broadcastJson('{"version":1,"source":"palws","event":"' .. reason
+        .. '","pals":[' .. table.concat(all, ",") .. "]}")
+    print("[Palws] dumpAll exit ok, total " .. #all .. " pals
+")
+    dumping = false
+    if pendingDump then
+        pendingDump = false
+        ExecuteWithDelay(200, function() dumpAll("queued") end)
     end
-    for page = 2, maxPage do
-        if boxUI == nil or not isValid(boxUI) then break end
-        local okP = pcall(function() boxUI:SetPagePalBoxList(page - 1) end)
-        if not okP then break end
-        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-        if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do collectDup(c) end
-        end
-    end
-    if boxUI ~= nil then pcall(function() boxUI:SetPagePalBoxList(0) end) end
-    print(string.format("[Palws] dumpAll sweep: %d pages in %.3fs\n", maxPage, os.clock() - t0))
-    finish()
 end
 
 -- PalBox is paged (30 slots/page, up to 32 pages = 960): slots beyond the
@@ -1402,3 +1362,17 @@ do
 end
 
 print("[Palws] loaded. F5=deep-diag F6=capture F7=dump F8=fake\n")
+
+-- PalBox slots wake only when the user browses pages. Hook the page-turn
+-- event (fires with the new page's slot list) and re-dump afterwards — the
+-- container pass then sees the newly-woken slots. Passive: no programmatic
+-- page turning, no Get(i) storm, no crash.
+local okHook, hookErr = pcall(function()
+    RegisterHook("/Script/Pal.PalUIPalBoxBase:OnUpdatePagePalBoxList",
+        guarded("palbox-page", function()
+            if not dumping then
+                ExecuteWithDelay(150, function() dumpAll("page-turn") end)
+            end
+        end))
+end)
+print("[Palws] OnUpdatePagePalBoxList hook: " .. (okHook and "ok" or ("FAILED " .. tostring(hookErr))) .. "\n")
