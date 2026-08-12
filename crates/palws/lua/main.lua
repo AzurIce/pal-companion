@@ -684,7 +684,9 @@ end
 -- page's container is materialized; other pages are loaded lazily via UI page
 -- turns. Find the box UI (maxPage > 1), turn every page, and collect any
 -- newly-appeared PalIndividualCharacterContainer through `collect`.
-local function dumpAllPages(collect)
+-- NOTE: global (not local) — dumpAll above references it; a local declared
+-- after dumpAll would be lexically invisible (nil) at dumpAll's definition.
+function dumpAllPages(collect)
     local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
     if not (okU and type(uis) == "table") then return 0 end
     local boxUI = nil
