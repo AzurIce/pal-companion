@@ -16,6 +16,7 @@ local READ_PASSIVES = true   -- RE-VERIFY on UE4SS Experimental: FName array mar
 local READ_GENDER   = true   -- RE-VERIFY on UE4SS Experimental (Palworld): UEnum::Names 0x48 layout
 local READ_NICKNAME = true   -- struct FString member, suspected safe
 local MAX_DUMP_PALS = 600
+local FORCE_SYNC_EXPERIMENT_ONLY = true
 
 print("[Palws] mod loading\n")
 
@@ -905,7 +906,7 @@ local function pump()
     -- is observed in the world (dynamic full-path registration)
     sweepDynamicHooks()
     pcall(pollTerminal)
-    if dirty then
+    if dirty and not FORCE_SYNC_EXPERIMENT_ONLY then
         dirty = false
         ExecuteWithDelay(1500, guarded("pump-dump", function()
             ExecuteInGameThread(guarded("dumpAll-timer", function()
@@ -926,6 +927,10 @@ RegisterKeyBind(Key.F6, guarded("F6", function()
 end))
 
 RegisterKeyBind(Key.F7, guarded("F7", function()
+    if FORCE_SYNC_EXPERIMENT_ONLY then
+        print("[Palws] F7 disabled during force-sync experiment\n")
+        return
+    end
     ExecuteInGameThread(guarded("dumpAll-f7", function()
         local okD, errD = pcall(dumpAll, "manual-f7")
         if not okD then print("[Palws] dumpAll ERROR: " .. tostring(errD) .. "\n") end
