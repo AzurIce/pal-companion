@@ -702,10 +702,24 @@ local function dumpAll(reason)
     local page = 1
     local step = nil
     step = function()
-        pcall(function() boxUI:SetPagePalBoxList(page - 1) end)
+        -- 纯虚函数崩（GIsRunning==1）风险：翻页销毁/重建容器对象。
+        -- 每步检查 UI 存活，销毁或翻页失败即安全中止（保留已收集数据）。
+        if not isValid(boxUI) then
+            print("[Palws] dumpAll abort: box UI gone\n")
+            finish()
+            return
+        end
+        local okPage = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
+        if not okPage then
+            print("[Palws] dumpAll abort: page turn failed\n")
+            finish()
+            return
+        end
         local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
         if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do collect(c) end
+            for _, c in ipairs(cons) do
+                if isValid(c) then collect(c) end
+            end
         end
         page = page + 1
         if page > maxPage then
