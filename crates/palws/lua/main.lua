@@ -1175,8 +1175,8 @@ RegisterKeyBind(Key.F5, guarded("F5", function()
             end
         end
         local okP, models = pcall(function() return FindAllOf("PalUIPalStorageModel") end)
-        print("[Palws] F5: PalUIPalStorageModel count=" .. tostring(okP and #models or "err") .. "\n")
-        if okP then
+        print("[Palws] F5: PalUIPalStorageModel count=" .. tostring(okP and models and #models or "err") .. "\n")
+        if okP and type(models) == "table" then
             for _, m in ipairs(models) do
                 local okN, n = pcall(function() return m:GetWholePageCount() end)
                 local okT, tgt = pcall(function() return m:GetTargetContainerId() end)
