@@ -1251,8 +1251,11 @@ end))
 -- pal fields, scan the 960-slot container, turn pages, or broadcast a payload.
 local forceSyncExperiment = {
     active = false,
+    mode = nil,
     callbacks = 0,
     callbackErrors = 0,
+    requestedPages = 0,
+    requestErrors = 0,
     uniqueSlots = {},
     pages = {},
     minSlot = nil,
@@ -1280,8 +1283,11 @@ local function getLocalPlayerState()
 end
 
 local function resetForceSyncExperiment()
+    forceSyncExperiment.mode = nil
     forceSyncExperiment.callbacks = 0
     forceSyncExperiment.callbackErrors = 0
+    forceSyncExperiment.requestedPages = 0
+    forceSyncExperiment.requestErrors = 0
     forceSyncExperiment.uniqueSlots = {}
     forceSyncExperiment.pages = {}
     forceSyncExperiment.minSlot = nil
@@ -1292,6 +1298,27 @@ local function countForceSyncEntries(entries)
     local count = 0
     for _ in pairs(entries) do count = count + 1 end
     return count
+end
+
+local function finishForceSyncExperiment(playerState)
+    local okDisable, disableErr = pcall(function()
+        if isValid(playerState) then
+            playerState:RequestForceSyncPalBoxSlot_ToServer(false)
+        end
+    end)
+    forceSyncExperiment.active = false
+    print(string.format(
+        "[Palws] force-sync result: mode=%s requestedPages=%d requestErrors=%d callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s callbackErrors=%d disable=%s\n",
+        tostring(forceSyncExperiment.mode),
+        forceSyncExperiment.requestedPages,
+        forceSyncExperiment.requestErrors,
+        forceSyncExperiment.callbacks,
+        countForceSyncEntries(forceSyncExperiment.uniqueSlots),
+        countForceSyncEntries(forceSyncExperiment.pages),
+        tostring(forceSyncExperiment.minSlot),
+        tostring(forceSyncExperiment.maxSlot),
+        forceSyncExperiment.callbackErrors,
+        okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
 end
 
 local okRepHook, repHookErr = pcall(function()
@@ -1339,6 +1366,7 @@ RegisterKeyBind(Key.F9, guarded("F9", function()
         end
 
         resetForceSyncExperiment()
+        forceSyncExperiment.mode = "force-only"
         forceSyncExperiment.active = true
         local okEnable, enableErr = pcall(function()
             playerState:RequestForceSyncPalBoxSlot_ToServer(true)
@@ -1352,23 +1380,80 @@ RegisterKeyBind(Key.F9, guarded("F9", function()
 
         ExecuteWithDelay(5000, guarded("force-sync-finish-delay", function()
             ExecuteInGameThread(guarded("force-sync-finish", function()
-                local okDisable, disableErr = pcall(function()
-                    if isValid(playerState) then
-                        playerState:RequestForceSyncPalBoxSlot_ToServer(false)
-                    end
-                end)
-                forceSyncExperiment.active = false
-                print(string.format(
-                    "[Palws] force-sync result: callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s callbackErrors=%d disable=%s\n",
-                    forceSyncExperiment.callbacks,
-                    countForceSyncEntries(forceSyncExperiment.uniqueSlots),
-                    countForceSyncEntries(forceSyncExperiment.pages),
-                    tostring(forceSyncExperiment.minSlot),
-                    tostring(forceSyncExperiment.maxSlot),
-                    forceSyncExperiment.callbackErrors,
-                    okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
+                finishForceSyncExperiment(playerState)
             end))
         end))
+    end))
+end))
+
+RegisterKeyBind(Key.F10, guarded("F10", function()
+    if forceSyncExperiment.active then
+        print("[Palws] force-sync experiment already active\n")
+        return
+    end
+    ExecuteInGameThread(guarded("page-sync-start", function()
+        local playerState = getLocalPlayerState()
+        if not isValid(playerState) then
+            print("[Palws] page-sync: local PlayerState not found\n")
+            return
+        end
+
+        resetForceSyncExperiment()
+        forceSyncExperiment.mode = "force-plus-pages"
+        forceSyncExperiment.active = true
+        local okEnable, enableErr = pcall(function()
+            playerState:RequestForceSyncPalBoxSlot_ToServer(true)
+        end)
+        if not okEnable then
+            forceSyncExperiment.active = false
+            print("[Palws] page-sync force enable FAILED: " .. tostring(enableErr) .. "\n")
+            return
+        end
+        print("[Palws] page-sync enabled; requesting pages 0..31 at 200ms intervals\n")
+
+        local nextPage = 0
+        local requestNextPage
+        requestNextPage = function()
+            ExecuteInGameThread(function()
+                local okStep, stepErr = pcall(function()
+                    if not forceSyncExperiment.active or not isValid(playerState) then
+                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
+                        finishForceSyncExperiment(playerState)
+                        return
+                    end
+
+                    local page = nextPage
+                    local okRequest, requestErr = pcall(function()
+                        playerState:RequestPalBoxSyncPage_ToServer(page)
+                    end)
+                    if okRequest then
+                        forceSyncExperiment.requestedPages = forceSyncExperiment.requestedPages + 1
+                    else
+                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
+                        print("[Palws] page-sync request " .. page .. " FAILED: "
+                            .. tostring(requestErr) .. "\n")
+                    end
+
+                    nextPage = nextPage + 1
+                    if nextPage < 32 then
+                        ExecuteWithDelay(200, requestNextPage)
+                    else
+                        print("[Palws] page-sync requests sent; waiting 3s for replication\n")
+                        ExecuteWithDelay(3000, guarded("page-sync-finish-delay", function()
+                            ExecuteInGameThread(guarded("page-sync-finish", function()
+                                finishForceSyncExperiment(playerState)
+                            end))
+                        end))
+                    end
+                end)
+                if not okStep then
+                    forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
+                    print("[Palws] page-sync step FAILED: " .. tostring(stepErr) .. "\n")
+                    finishForceSyncExperiment(playerState)
+                end
+            end)
+        end
+        requestNextPage()
     end))
 end))
 
@@ -1384,6 +1469,7 @@ do
         "getContainers", "containerSummary", "dumpContainerPals", "dumpAll",
         "walkObjectProps", "census", "pollTerminal", "pump",
         "getLocalPlayerState", "resetForceSyncExperiment", "countForceSyncEntries",
+        "finishForceSyncExperiment",
         "buildClassCache", "buildStructCache",
     }
     local scope = {
@@ -1402,6 +1488,7 @@ do
         getLocalPlayerState=getLocalPlayerState,
         resetForceSyncExperiment=resetForceSyncExperiment,
         countForceSyncEntries=countForceSyncEntries,
+        finishForceSyncExperiment=finishForceSyncExperiment,
         buildClassCache=buildClassCache, buildStructCache=buildStructCache,
     }
     local fails = {}
