@@ -333,7 +333,9 @@ pub fn OwnedSidebar() -> Element {
                                 Gender::Female => "female",
                             };
                             let p = pal.clone();
-                            let fav_label = ["", "I", "II", "III"][pal.favorite.min(3) as usize].to_string();
+                            let favorite = pal.favorite.min(3);
+                            let fav_label = ["", "I", "II", "III"][favorite as usize].to_string();
+                            let fav_icon = format!("icons/favorite-lock-{favorite}.png");
                             rsx! {
                                 button {
                                     key: "{pal.id}",
@@ -350,8 +352,13 @@ pub fn OwnedSidebar() -> Element {
                                         } else if pal.is_boss {
                                             span { class: "avatar-badge avatar-badge--boss", "👑" }
                                         }
-                                        if pal.favorite > 0 {
-                                            span { class: "avatar-badge avatar-badge--fav", "{fav_label}" }
+                                        if favorite > 0 {
+                                            img {
+                                                class: "avatar-badge-img avatar-badge-img--fav",
+                                                src: "{fav_icon}",
+                                                alt: "最爱 {fav_label}",
+                                                title: "最爱 {fav_label}",
+                                            }
                                         }
                                     }
                                     div { class: "owned-item-main",
