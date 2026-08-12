@@ -12,7 +12,7 @@
 -- 0-based; GetSlots() Lua array is 1-based.
 
 -- field switches for crash bisecting: off = never invoked, outputs default
-local READ_PASSIVES = false  -- PRIME SUSPECT (FName array elements); default OFF
+local READ_PASSIVES = true   -- RE-VERIFY on UE4SS Experimental: FName array marshaling
 local READ_GENDER   = true   -- RE-VERIFY on UE4SS Experimental (Palworld): UEnum::Names 0x48 layout
 local READ_NICKNAME = true   -- struct FString member, suspected safe
 local MAX_DUMP_PALS = 600
@@ -405,8 +405,10 @@ local function readField(name, verbose, fn)
 end
 
 local function readMemFields(param)
-    -- direct memory read via rust; bypasses UE4SS enum/array property reads.
-    -- pass the parameter OBJECT address; rust derives the struct base.
+    -- rust read_saveparam was removed (reflection authoritative since the
+    -- UE4SS Experimental Palworld build fixed enum/FName marshaling);
+    -- guard so a stale dll still degrades gracefully instead of erroring.
+    if type(palws.read_saveparam) ~= "function" then return nil end
     local okA, addr = pcall(function() return param:GetAddress() end)
     if not okA or type(addr) ~= "number" or addr == 0 then
         return nil
@@ -428,29 +430,23 @@ local function buildPalJson(param, idx, verbose)
     local favorite = readField("favorite", verbose, function() return readFavorite(param) end)
     local lucky = readField("lucky", verbose, function() return readLucky(param) end)
     local memfrag  = readField("memfields", verbose, function() return readMemFields(param) end)
-    local hasMem = memfrag ~= nil and memfrag ~= ""
+    -- NOTE: reflection reads are authoritative now (UE4SS Experimental
+    -- Palworld build: UEnum::Names 0x48 layout fixed enum + FName marshaling).
+    -- memfrag (rust raw-memory path) no longer feeds the payload; the call is
+    -- kept so F5 deep-diag can still cross-check the two paths.
 
     local parts = {}
     parts[#parts + 1] = '"species":' .. jsonStr(species)
-    if not hasMem then
-        parts[#parts + 1] = '"gender":' .. jsonStr(gender or "unknown")
+    parts[#parts + 1] = '"gender":' .. jsonStr(gender or "unknown")
+    local ps = {}
+    if passives then
+        for _, p in ipairs(passives) do ps[#ps + 1] = jsonStr(p) end
     end
-    if not hasMem then
-        local ps = {}
-        if passives then
-            for _, p in ipairs(passives) do ps[#ps + 1] = jsonStr(p) end
-        end
-        parts[#parts + 1] = '"passives":[' .. table.concat(ps, ",") .. "]" -- always array
-    end
-    if not hasMem then
-        parts[#parts + 1] = '"nickname":' .. jsonStr(nickname)
-    end
+    parts[#parts + 1] = '"passives":[' .. table.concat(ps, ",") .. "]" -- always array
+    parts[#parts + 1] = '"nickname":' .. jsonStr(nickname)
     parts[#parts + 1] = '"level":' .. (level and tostring(level) or "null")
     parts[#parts + 1] = '"favorite":' .. tostring(favorite or 0)
     parts[#parts + 1] = '"lucky":' .. tostring(lucky == true)
-    if hasMem then
-        parts[#parts + 1] = memfrag -- rust-read fields (gender/nickname/talent/...)
-    end
     return "{" .. table.concat(parts, ",") .. "}"
 end
 

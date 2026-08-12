@@ -268,6 +268,38 @@ unsafe fn echo_impl(l: *mut lua_State) -> c_int {
 }
 
 
+// ---------------------------------------------------------------------------
+// read_saveparam: direct memory read of FPalIndividualCharacterSaveParameter.
+// Offsets computed from the kit header declaration order (natural x64
+// alignment); Lua passes the struct address (sp:GetAddress()), numbers only.
+// This bypasses UE4SS's broken enum/array property reads entirely.
+// ---------------------------------------------------------------------------
+
+const O_GENDER: usize = 0x10; // EPalGenderType : uint8 (0=None 1=Male 2=Female)
+const O_LEVEL: usize = 0x20; // uint8
+const O_RANK: usize = 0x21; // uint8
+const O_RANK_HP: usize = 0x24; // uint8 x4
+const O_RANK_ATTACK: usize = 0x25;
+const O_RANK_DEFENCE: usize = 0x26;
+const O_RANK_CRAFTSPEED: usize = 0x27;
+const O_EXP: usize = 0x28; // int64
+const O_NICKNAME: usize = 0x30; // FString
+const O_FILTERED: usize = 0x40; // FString
+const O_TALENT_HP: usize = 0x80; // uint8 x4 (individual values)
+const O_TALENT_MELEE: usize = 0x81;
+const O_TALENT_SHOT: usize = 0x82;
+const O_TALENT_DEFENSE: usize = 0x83;
+const O_PASSIVES: usize = 0x90; // TArray<FName>
+const O_CRAFTSPEED: usize = 0xEC; // int32
+
+// Offset of the FPalIndividualCharacterSaveParameter struct inside
+// UPalIndividualCharacterParameter, calibrated empirically from hexdump
+// anchors (Level=41 byte @ struct+0x20, Exp=517320 @ +0x28, talents in
+// 0..=100 @ +0x80, FullStomach float ~90.45 @ +0x84 — all consistent).
+// Lua passes the parameter OBJECT address (param:GetAddress()); the struct
+// base is derived here. Version-specific (game v0.7.x).
+const SAVEPARAM_OFF: usize = 0x3D0;
+
 #[cfg(windows)]
 fn is_readable(addr: usize, len: usize) -> bool {
     if addr < 0x1_0000 || addr > 0x0000_7FFF_FFFF_0000 || len > 0x10_0000 {
@@ -300,9 +332,265 @@ fn is_readable(_addr: usize, _len: usize) -> bool {
     false
 }
 
+fn ru8(base: usize, off: usize) -> Option<u8> {
+    if is_readable(base + off, 1) {
+        Some(unsafe { ((base + off) as *const u8).read_volatile() })
+    } else {
+        None
+    }
+}
 
+fn ru32(base: usize, off: usize) -> Option<u32> {
+    if is_readable(base + off, 4) {
+        Some(unsafe { ((base + off) as *const u32).read_volatile() })
+    } else {
+        None
+    }
+}
 
+fn ru64(base: usize, off: usize) -> Option<u64> {
+    if is_readable(base + off, 8) {
+        Some(unsafe { ((base + off) as *const u64).read_volatile() })
+    } else {
+        None
+    }
+}
 
+fn rptr(base: usize, off: usize) -> Option<usize> {
+    ru64(base, off).map(|v| v as usize)
+}
+
+fn read_fstring(base: usize, off: usize) -> Option<String> {
+    let data = rptr(base, off)?;
+    let num = ru32(base, off + 8)? as i32; // wchar count including NUL
+    if data == 0 || num <= 1 {
+        return Some(String::new());
+    }
+    if num > 512 {
+        return None;
+    }
+    if !is_readable(data, num as usize * 2) {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(data as *const u16, (num - 1) as usize) };
+    Some(String::from_utf16_lossy(slice))
+}
+
+fn json_escape(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+fn json_str_or_null(s: &str) -> String {
+    if s.is_empty() {
+        "null".to_string()
+    } else {
+        format!("\"{}\"", json_escape(s))
+    }
+}
+
+static MEMREAD_LOGGED: AtomicUsize = AtomicUsize::new(0);
+
+// ---------------------------------------------------------------------------
+// FName -> String via FName::ToString. UE4SS logs the resolved runtime
+// address at init ("[PS] Found FName::ToString: 0x..."); we harvest it from
+// UE4SS.log (located next to the game exe, three dirs up from our dll).
+// ---------------------------------------------------------------------------
+
+static FNAME_TOSTRING: AtomicUsize = AtomicUsize::new(usize::MAX); // MAX=unresolved, 0=failed
+
+#[cfg(windows)]
+fn dll_dir() -> Option<std::path::PathBuf> {
+    extern "system" {
+        fn GetModuleHandleExW(dwFlags: u32, lpModuleName: *const u16, phModule: *mut isize) -> i32;
+        fn GetModuleFileNameW(hModule: isize, lpFilename: *mut u16, nSize: u32) -> u32;
+    }
+    const FROM_ADDRESS: u32 = 0x4;
+    const UNCHANGED_REFCOUNT: u32 = 0x2;
+    let mut h: isize = 0;
+    let ok = unsafe {
+        GetModuleHandleExW(FROM_ADDRESS | UNCHANGED_REFCOUNT, dll_dir as *const u16, &mut h)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let mut buf = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..n as usize]);
+    std::path::PathBuf::from(path).parent().map(|p| p.to_path_buf())
+}
+
+#[cfg(not(windows))]
+fn dll_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
+fn resolve_fname_tostring() -> Option<usize> {
+    let cur = FNAME_TOSTRING.load(Ordering::SeqCst);
+    if cur != usize::MAX {
+        return if cur == 0 { None } else { Some(cur) };
+    }
+    let mut found = 0usize;
+    if let Some(dir) = dll_dir() {
+        // scripts -> Palws -> Mods -> Win64
+        if let Some(win64) = dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+        {
+            let logp = win64.join("UE4SS.log");
+            if let Ok(content) = std::fs::read_to_string(&logp) {
+                for line in content.lines() {
+                    if let Some(pos) = line.find("Found FName::ToString: 0x") {
+                        let hex = line[pos + "Found FName::ToString: 0x".len()..].trim();
+                        if let Ok(v) = usize::from_str_radix(hex, 16) {
+                            found = v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    log_line(&format!("[fname] FName::ToString resolve -> {:#x}", found));
+    FNAME_TOSTRING.store(found, Ordering::SeqCst);
+    if found == 0 { None } else { Some(found) }
+}
+
+#[repr(C)]
+struct FStrOut {
+    data: u64,
+    num: i32,
+    max: i32,
+}
+
+/// Resolve an FName (8 bytes at fname_addr) via the game's own
+/// FName::ToString. NOTE: out.data is allocated by the game allocator and
+/// intentionally leaked (a few bytes per call, only on terminal dumps).
+fn fname_to_string(fname_addr: usize) -> Option<String> {
+    let f = resolve_fname_tostring()?;
+    if !is_readable(fname_addr, 8) {
+        return None;
+    }
+    type ToStringFn = unsafe extern "C" fn(this_: usize, out: *mut FStrOut);
+    let fnc: ToStringFn = unsafe { std::mem::transmute(f) };
+    let mut out = FStrOut { data: 0, num: 0, max: 0 };
+    unsafe { fnc(fname_addr, &mut out) };
+    if out.data == 0 || out.num <= 1 {
+        return Some(String::new());
+    }
+    if out.num > 256 || !is_readable(out.data as usize, out.num as usize * 2) {
+        return None;
+    }
+    let slice =
+        unsafe { std::slice::from_raw_parts(out.data as *const u16, (out.num - 1) as usize) };
+    Some(String::from_utf16_lossy(slice))
+}
+
+fn read_passives(base: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    if let (Some(data), Some(num)) = (rptr(base, O_PASSIVES), ru32(base, O_PASSIVES + 8)) {
+        if data != 0 {
+            for i in 0..num.min(16) as usize {
+                if let Some(s) = fname_to_string(data + i * 8) {
+                    if !s.is_empty() {
+                        out.push(s);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+unsafe fn read_saveparam_impl(l: *mut lua_State) -> c_int {
+    let mut isnum: c_int = 0;
+    let addr = lua_tointegerx(l, 1, &mut isnum) as usize;
+    if isnum == 0 || addr == 0 || !is_readable(addr, 0x100) {
+        push_str(l, "");
+        return 1;
+    }
+    let base = addr + SAVEPARAM_OFF;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(g) = ru8(base, O_GENDER) {
+        parts.push(format!(
+            "\"gender\":\"{}\"",
+            match g {
+                1 => "male",
+                2 => "female",
+                _ => "unknown",
+            }
+        ));
+    }
+    if let Some(nick) = read_fstring(base, O_NICKNAME) {
+        parts.push(format!("\"nickname\":{}", json_str_or_null(&nick)));
+    }
+    if let Some(f) = read_fstring(base, O_FILTERED) {
+        parts.push(format!("\"filtered_nickname\":{}", json_str_or_null(&f)));
+    }
+    if let Some(v) = ru8(base, O_LEVEL) {
+        parts.push(format!("\"level_mem\":{}", v));
+    }
+    if let Some(v) = ru8(base, O_RANK) {
+        parts.push(format!("\"rank\":{}", v));
+    }
+    if let (Some(h), Some(m), Some(s), Some(d)) = (
+        ru8(base, O_TALENT_HP),
+        ru8(base, O_TALENT_MELEE),
+        ru8(base, O_TALENT_SHOT),
+        ru8(base, O_TALENT_DEFENSE),
+    ) {
+        parts.push(format!(
+            "\"talent\":{{\"hp\":{},\"melee\":{},\"shot\":{},\"defense\":{}}}",
+            h, m, s, d
+        ));
+    }
+    if let (Some(h), Some(a), Some(d), Some(c)) = (
+        ru8(base, O_RANK_HP),
+        ru8(base, O_RANK_ATTACK),
+        ru8(base, O_RANK_DEFENCE),
+        ru8(base, O_RANK_CRAFTSPEED),
+    ) {
+        parts.push(format!(
+            "\"rank_stats\":{{\"hp\":{},\"attack\":{},\"defence\":{},\"craft_speed\":{}}}",
+            h, a, d, c
+        ));
+    }
+    if let Some(e) = ru64(base, O_EXP) {
+        parts.push(format!("\"exp\":{}", e));
+    }
+    if let Some(c) = ru32(base, O_CRAFTSPEED) {
+        parts.push(format!("\"craft_speed\":{}", c));
+    }
+    let passives = read_passives(base);
+    parts.push(format!(
+        "\"passives\":[{}]",
+        passives
+            .iter()
+            .map(|p| format!("\"{}\"", json_escape(p)))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    let frag = parts.join(",");
+    let n = MEMREAD_LOGGED.fetch_add(1, Ordering::SeqCst);
+    if n < 5 {
+        log_line(&format!("[read_saveparam] addr={:#x} frag=[{}]", addr, frag));
+    }
+    push_str(l, &frag);
+    1
+}
 
 unsafe fn ping_impl(l: *mut lua_State) -> c_int {
     push_str(l, "pong from rust");
@@ -373,6 +661,7 @@ export_fn!(start_server, "start_server", start_server_impl);
 export_fn!(broadcast_lua, "broadcast", broadcast_impl);
 export_fn!(notify, "notify", notify_impl);
 export_fn!(echo, "echo", echo_impl);
+export_fn!(read_saveparam, "read_saveparam", read_saveparam_impl);
 export_fn!(hexdump, "hexdump", hexdump_impl);
 export_fn!(ping, "ping", ping_impl);
 export_fn!(version, "version", version_impl);
@@ -385,6 +674,7 @@ unsafe fn luaopen_impl(l: *mut lua_State) -> c_int {
         ("start_server", start_server),
         ("broadcast", broadcast_lua),
         ("client_count", client_count),
+        ("read_saveparam", read_saveparam),
         ("hexdump", hexdump),
         ("ping", ping),
         ("version", version),
