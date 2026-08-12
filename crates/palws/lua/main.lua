@@ -630,6 +630,8 @@ local function dumpContainerPals(container, cidx)
     return pals
 end
 
+local dumpAllPages
+
 local function dumpAll(reason)
     baseCampSeq = 0
     print("[Palws] dumpAll enter (" .. reason .. ")\n")
@@ -678,7 +680,7 @@ end
 -- page's container is materialized; other pages are loaded lazily via UI page
 -- turns. Find the box UI (maxPage > 1), turn every page, and collect any
 -- newly-appeared PalIndividualCharacterContainer through `collect`.
-local function dumpAllPages(collect)
+dumpAllPages = function(collect)
     local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
     if not (okU and type(uis) == "table") then return 0 end
     local boxUI = nil
