@@ -1288,6 +1288,12 @@ local function resetForceSyncExperiment()
     forceSyncExperiment.maxSlot = nil
 end
 
+local function countForceSyncEntries(entries)
+    local count = 0
+    for _ in pairs(entries) do count = count + 1 end
+    return count
+end
+
 local okRepHook, repHookErr = pcall(function()
     RegisterHook("/Script/Pal.PalIndividualCharacterSlot:OnRep_Parameter",
         function(Context)
@@ -1355,8 +1361,8 @@ RegisterKeyBind(Key.F9, guarded("F9", function()
                 print(string.format(
                     "[Palws] force-sync result: callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s callbackErrors=%d disable=%s\n",
                     forceSyncExperiment.callbacks,
-                    countTable(forceSyncExperiment.uniqueSlots),
-                    countTable(forceSyncExperiment.pages),
+                    countForceSyncEntries(forceSyncExperiment.uniqueSlots),
+                    countForceSyncEntries(forceSyncExperiment.pages),
                     tostring(forceSyncExperiment.minSlot),
                     tostring(forceSyncExperiment.maxSlot),
                     forceSyncExperiment.callbackErrors,
@@ -1377,7 +1383,7 @@ do
         "readField", "buildPalJson", "slotParam", "probeSlot",
         "getContainers", "containerSummary", "dumpContainerPals", "dumpAll",
         "walkObjectProps", "census", "pollTerminal", "pump",
-        "getLocalPlayerState", "resetForceSyncExperiment",
+        "getLocalPlayerState", "resetForceSyncExperiment", "countForceSyncEntries",
         "buildClassCache", "buildStructCache",
     }
     local scope = {
@@ -1395,6 +1401,7 @@ do
         walkObjectProps=walkObjectProps, census=census, pollTerminal=pollTerminal, pump=pump,
         getLocalPlayerState=getLocalPlayerState,
         resetForceSyncExperiment=resetForceSyncExperiment,
+        countForceSyncEntries=countForceSyncEntries,
         buildClassCache=buildClassCache, buildStructCache=buildStructCache,
     }
     local fails = {}
