@@ -1271,6 +1271,28 @@ RegisterKeyBind(Key.F5, guarded("F5", function()
                 print("[Palws]   container addr=" .. tostring(c:GetAddress()) .. " n=" .. tostring(n))
             end
         end
+        -- object census: are pal params/slots/handles all in memory (no page-turn needed)?
+        local okP2, params = pcall(function() return FindAllOf("PalIndividualCharacterParameter") end)
+        print("[Palws] F5: PalIndividualCharacterParameter=" .. tostring(okP2 and (params and #params or "nil") or "err") .. "\n")
+        local okS2, slots = pcall(function() return FindAllOf("PalIndividualCharacterSlot") end)
+        print("[Palws] F5: PalIndividualCharacterSlot=" .. tostring(okS2 and (slots and #slots or "nil") or "err") .. "\n")
+        local okH2, handles = pcall(function() return FindAllOf("PalIndividualCharacterHandle") end)
+        print("[Palws] F5: PalIndividualCharacterHandle=" .. tostring(okH2 and (handles and #handles or "nil") or "err") .. "\n")
+        -- on the 960-slot box container: how many slots actually resolve?
+        if okC and type(cons) == "table" then
+            for _, c in ipairs(cons) do
+                local num = tryCall(c, "Num")
+                if type(num) == "number" and math.floor(num) == 960 then
+                    local validSlots = 0
+                    for i = 0, 959 do
+                        local okS, s = pcall(function() return c:Get(i) end)
+                        if okS and isValid(s) then validSlots = validSlots + 1 end
+                    end
+                    print("[Palws] F5: box960 Get(i) valid slots=" .. validSlots .. "/960\n")
+                    break
+                end
+            end
+        end
         census()
     end))
 end))
