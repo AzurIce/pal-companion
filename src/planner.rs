@@ -54,6 +54,9 @@ pub struct OwnedPal {
     /// 据点序号（仅同步自游戏 base 容器的帕鲁有）；1-based per dump
     #[serde(default)]
     pub basecamp: Option<u8>,
+    /// 是否来自游戏同步（true=覆盖时会被清除；false=手动添加，覆盖时保留）
+    #[serde(default)]
+    pub synced: bool,
 }
 
 /// 帕鲁所在位置（同步自游戏的容器分组）
@@ -1105,6 +1108,7 @@ mod tests {
             nickname: None,
             is_lucky: false,
             basecamp: None,
+            synced: false,
         }
     }
 

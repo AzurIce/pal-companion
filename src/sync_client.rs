@@ -49,7 +49,7 @@ pub struct SyncStore {
 
 /// 把一批同步帕鲁合并进持有列表：过滤（物种/性别/图鉴/被动）+ 去重 + 详细 console 日志。
 /// 返回汇总文本（用于 toast / 结果条）。
-pub fn do_merge(pals: &mut Vec<OwnedPal>, synced: Vec<SyncedPal>) -> String {
+pub fn do_merge(pals: &mut Vec<OwnedPal>, synced: Vec<SyncedPal>, overwrite: bool) -> String {
     let received = synced.len();
     let incoming: Vec<OwnedPal> = synced
         .iter()
@@ -102,13 +102,22 @@ pub fn do_merge(pals: &mut Vec<OwnedPal>, synced: Vec<SyncedPal>) -> String {
         })
         .collect();
     let unrecognized = received - incoming.len();
-    let added = sync::merge_owned(pals, incoming);
+    let added = if overwrite {
+        sync::overwrite_owned(pals, incoming)
+    } else {
+        sync::merge_owned(pals, incoming)
+    };
     let dupes = received - unrecognized - added;
     web_sys::console::log_1(
-        &format!("[sync] 合并完成：收到 {received}，导入 {added}，重复 {dupes}，无法识别 {unrecognized}").into(),
+        &format!("[sync] {}：收到 {received}，写入 {added}，重复 {dupes}，无法识别 {unrecognized}",
+            if overwrite { "覆盖" } else { "合并" }).into(),
     );
 
-    let mut msg = format!("已导入 {added} 只");
+    let mut msg = if overwrite {
+        format!("已同步覆盖 {added} 只")
+    } else {
+        format!("已导入 {added} 只")
+    };
     let mut skipped = Vec::new();
     if dupes > 0 {
         skipped.push(format!("{dupes} 只重复"));
@@ -151,9 +160,9 @@ pub fn use_ws_sync() {
                                 Ok(Message::Text(text)) => match sync::parse_message(&text) {
                                     Ok(pals) => {
                                         if *sync.auto_merge.peek() {
-                                            // 自动合并：直接入库，toast 汇报
+                                            // 自动同步覆盖：游戏数据为权威，直接入库（覆盖旧同步数据）
                                             let summary =
-                                                do_merge(&mut owned_pals.write(), pals);
+                                                do_merge(&mut owned_pals.write(), pals, true);
                                             toast.set(Some(summary));
                                         } else {
                                             pending.set(pals);
@@ -195,7 +204,7 @@ pub fn SyncBanner() -> Element {
 
     let merge = move |_| {
         let list = std::mem::take(&mut *pending.write());
-        result.set(Some(do_merge(&mut pals.write(), list)));
+        result.set(Some(do_merge(&mut pals.write(), list, false)));
     };
 
     rsx! {

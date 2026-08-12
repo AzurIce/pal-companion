@@ -111,6 +111,7 @@ impl SyncedPal {
             nickname: self.nickname.clone(),
             is_lucky: self.lucky,
             basecamp: self.basecamp,
+            synced: true,
         })
     }
 }
@@ -187,6 +188,23 @@ fn dedupe_key(p: &OwnedPal) -> (String, Gender, Vec<String>) {
 /// - 按 (species, gender, 排序后 passives) 去重，已存在（含 incoming 内部重复）的跳过；
 /// - 新增条目 id 沿用现有惯例：当前最大 id + 1 递增（传入的 id 会被覆盖）。
 ///
+/// 自动同步覆盖：游戏数据为权威，全量替换此前同步来的帕鲁（synced=true），
+/// 保留手动添加的（synced=false）。返回新写入的数量。
+pub fn overwrite_owned(existing: &mut Vec<OwnedPal>, incoming: Vec<OwnedPal>) -> usize {
+    let before = existing.len();
+    existing.retain(|p| !p.synced);
+    let removed = before - existing.len();
+    let mut next = existing.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+    for mut p in incoming {
+        p.id = next;
+        next += 1;
+        p.synced = true;
+        existing.push(p);
+    }
+    let _ = removed;
+    existing.len() - before + removed
+}
+
 /// 返回实际新增的数量。
 pub fn merge_owned(existing: &mut Vec<OwnedPal>, incoming: Vec<OwnedPal>) -> usize {
     let mut seen: std::collections::HashSet<_> = existing.iter().map(dedupe_key).collect();

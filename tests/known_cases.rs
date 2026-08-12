@@ -75,6 +75,7 @@ fn op(id: u64, species: &str, gender: Gender) -> OwnedPal {
         nickname: None,
         is_lucky: false,
         basecamp: None,
+            synced: false,
     }
 }
 
@@ -127,6 +128,7 @@ fn owned_lotusdragon_used_as_parent_not_bred() {
             nickname: None,
             is_lucky: false,
             basecamp: None,
+            synced: false,
         }
     }
     fn nodes(root: &PlanNode, out: &mut Vec<PlanNode>) {

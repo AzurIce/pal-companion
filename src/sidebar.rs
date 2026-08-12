@@ -594,6 +594,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                     favorite: favorite.read().parse().unwrap_or(0),
                     nickname: if n.is_empty() { None } else { Some(n) },
                     basecamp: None,
+            synced: false,
                 });
             }
         }
