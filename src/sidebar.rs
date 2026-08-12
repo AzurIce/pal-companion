@@ -152,6 +152,8 @@ pub fn OwnedSidebar() -> Element {
     let mut filter = use_signal(String::new);
     // 分组 tab：all / party / box / base（同步来的帕鲁带容器分组）
     let tab = use_signal(|| "all".to_string());
+    // 据点子 tab："all" 或据点序号（base tab 下显示）
+    let base_tab = use_signal(|| "all".to_string());
     let mut dialog_open = use_signal(|| false);
     let mut editing = use_signal(|| None::<OwnedPal>);
     let mut import_open = use_signal(|| false);
@@ -162,24 +164,61 @@ pub fn OwnedSidebar() -> Element {
 
     let q = filter.read().to_lowercase();
     let group_tab = tab.read().clone();
-    let mut list: Vec<OwnedPal> = store
-        .pals
-        .read()
+    let base_filter = base_tab.read().clone();
+    let all_pals = store.pals.read();
+    // 各分组数量（未筛选统计，供 tab 徽标）
+    let (mut n_party, mut n_box, mut n_base) = (0usize, 0usize, 0usize);
+    let mut basecamps: Vec<u8> = Vec::new();
+    for p in all_pals.iter() {
+        match p.group {
+            PalGroup::Party => n_party += 1,
+            PalGroup::Box => n_box += 1,
+            PalGroup::Base => {
+                n_base += 1;
+                if let Some(bc) = p.basecamp {
+                    if !basecamps.contains(&bc) { basecamps.push(bc); }
+                }
+            }
+        }
+    }
+    basecamps.sort_unstable();
+    let total = all_pals.len();
+    let mut list: Vec<OwnedPal> = all_pals
         .iter()
         .filter(|p| matches_query(p, &q))
         .filter(|p| {
-            group_tab == "all"
+            let ok_group = group_tab == "all"
                 || (group_tab == "party" && p.group == PalGroup::Party)
                 || (group_tab == "box" && p.group == PalGroup::Box)
-                || (group_tab == "base" && p.group == PalGroup::Base)
+                || (group_tab == "base" && p.group == PalGroup::Base);
+            if !ok_group { return false; }
+            // 据点子 tab 过滤（仅 base tab 且选了具体据点时生效）
+            if group_tab == "base" && base_filter != "all" {
+                return p.basecamp.map(|b| b.to_string()) == Some(base_filter.clone());
+            }
+            true
         })
         .cloned()
         .collect();
     // 统一按图鉴编号排序
     list.sort_by_key(|p| db().pal(&p.species).map(|s| s.paldex_no));
 
+    // 据点子 tab 选项（rsx! 外构造，避免结构体字面量与 rsx! 语法冲突）
+    let base_opts = if group_tab == "base" && !basecamps.is_empty() {
+        let mut opts = vec![Segment { value: "all".to_string(), label: "全部据点".to_string() }];
+        for bc in &basecamps {
+            let n_bc = all_pals.iter().filter(|p| p.basecamp == Some(*bc)).count();
+            opts.push(Segment {
+                value: bc.to_string(),
+                label: format!("据点 {bc} ({n_bc})"),
+            });
+        }
+        Some(opts)
+    } else {
+        None
+    };
+
     let open = *state.open.read();
-    let total = store.pals.read().len();
 
     rsx! {
         aside { class: if open { "sidebar" } else { "sidebar sidebar--closed" },
@@ -258,12 +297,18 @@ pub fn OwnedSidebar() -> Element {
                 div { class: "sidebar-sort",
                     Segmented {
                         options: vec![
-                            Segment { value: "all".to_string(), label: "全部".to_string() },
-                            Segment { value: "party".to_string(), label: "队伍".to_string() },
-                            Segment { value: "box".to_string(), label: "盒子".to_string() },
-                            Segment { value: "base".to_string(), label: "据点".to_string() },
+                            Segment { value: "all".to_string(), label: format!("全部 ({total})") },
+                            Segment { value: "party".to_string(), label: format!("队伍 ({n_party})") },
+                            Segment { value: "box".to_string(), label: format!("盒子 ({n_box})") },
+                            Segment { value: "base".to_string(), label: format!("据点 ({n_base})") },
                         ],
                         value: tab,
+                    }
+                }
+                // 据点子 tab：base 分组下按据点序号分组显示
+                if let Some(opts) = &base_opts {
+                    div { class: "sidebar-sort sidebar-sort--sub",
+                        Segmented { options: opts.clone(), value: base_tab }
                     }
                 }
                 // 游戏同步提示条（有待确认列表时出现）
@@ -548,6 +593,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                     is_lucky: *is_lucky.read(),
                     favorite: favorite.read().parse().unwrap_or(0),
                     nickname: if n.is_empty() { None } else { Some(n) },
+                    basecamp: None,
                 });
             }
         }

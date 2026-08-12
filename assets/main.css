@@ -1152,7 +1152,38 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 
 /* 状态栏与 toast */
 footer.statusbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; text-align: left; padding: 8px 24px; }
-.auto-merge-toggle { display: inline-flex; align-items: center; gap: 4px; margin-left: 12px; cursor: pointer; }
-.auto-merge-toggle input { width: 14px; height: 14px; }
+/* 自动合并：滑块开关（点击切换） */
+.sync-switch { display: inline-flex; align-items: center; gap: 6px; margin-left: 12px; cursor: pointer; user-select: none; }
+.sync-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
+.sync-switch-track {
+    position: relative;
+    width: 30px; height: 16px;
+    background: var(--muted-foreground);
+    opacity: .5;
+    border-radius: 999px;
+    transition: background .2s, opacity .2s;
+    flex: none;
+}
+.sync-switch-track::before {
+    content: "";
+    position: absolute;
+    left: 2px; top: 2px;
+    width: 12px; height: 12px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform .2s;
+}
+.sync-switch input:checked + .sync-switch-track {
+    background: hsl(142 71% 45%);
+    opacity: 1;
+}
+.sync-switch input:checked + .sync-switch-track::before {
+    transform: translateX(14px);
+}
+.sync-switch input:focus-visible + .sync-switch-track { outline: 2px solid var(--border); outline-offset: 2px; }
+/* 据点子 tab（base 分组下的二级 tab） */
+.sidebar-sort--sub { margin-top: 6px; }
+.sidebar-sort--sub .segmented { flex-wrap: wrap; gap: 4px; }
+.sidebar-sort--sub .segmented button { font-size: 11.5px; padding: 3px 8px; }
 .sync-toast { position: fixed; right: 24px; bottom: 48px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius, 8px); padding: 10px 16px; box-shadow: 0 4px 16px rgba(0,0,0,.18); z-index: 100; font-size: 13px; }
 .lucky-tag { font-size: 11px; color: #a16207; background: #fef9c3; border-radius: var(--radius, 4px); padding: 0 4px; margin-left: 4px; }

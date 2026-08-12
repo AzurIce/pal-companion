@@ -561,6 +561,8 @@ local function containerSummary(container)
     return num, nslots, firstPal
 end
 
+local baseCampSeq = 0  -- per-dump base container ordinal (reset in dumpAll)
+
 local function dumpContainerPals(container, cidx)
     local num = tryCall(container, "Num")
     local slots = tryCall(container, "GetSlots")
@@ -588,6 +590,12 @@ local function dumpContainerPals(container, cidx)
             if pj then
                 -- tag each pal with its container index + group (party/box/base)
                 pj = pj:sub(1, 1) .. '"container":' .. cidx .. ',"group":"' .. group .. '",' .. pj:sub(2)
+                if group == "base" then
+                    -- base camps are one container each; tag an ordinal so the
+                    -- app can group them into per-camp tabs
+                    baseCampSeq = baseCampSeq + 1
+                    pj = pj:sub(1, 1) .. '"basecamp":' .. baseCampSeq .. ',' .. pj:sub(2)
+                end
                 pals[#pals + 1] = pj
                 if verbose then print("[Palws]   pal[" .. i .. "]: " .. pj .. "\n") end
             end
@@ -602,6 +610,7 @@ local function dumpContainerPals(container, cidx)
 end
 
 local function dumpAll(reason)
+    baseCampSeq = 0
     print("[Palws] dumpAll enter (" .. reason .. ")\n")
     local containers = getContainers()
     print("[Palws] containers found: " .. #containers .. "\n")

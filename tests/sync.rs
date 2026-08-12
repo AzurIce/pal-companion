@@ -21,6 +21,7 @@ fn owned(id: u64, species: &str, gender: Gender, passives: &[&str]) -> OwnedPal 
         favorite: 0,
         nickname: None,
         is_lucky: false,
+        basecamp: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn draft_skips_missing_species_and_unknown_gender() {
             favorite: 0,
             nickname: None,
             is_lucky: false,
+            basecamp: None,
         })
     );
     // species 为 null → 跳过

@@ -78,6 +78,9 @@ pub struct SyncedPal {
     /// 幸运（闪光）标记，对应游戏 IsRarePal；缺省 false
     #[serde(default)]
     pub lucky: bool,
+    /// 据点序号（仅 base 帕鲁有）；缺省 → None
+    #[serde(default)]
+    pub basecamp: Option<u8>,
     /// 容器分组："party" / "box" / "base"（mod 按容器大小打标）；缺省 → 盒子
     #[serde(default)]
     pub group: Option<String>,
@@ -107,6 +110,7 @@ impl SyncedPal {
             favorite: self.favorite,
             nickname: self.nickname.clone(),
             is_lucky: self.lucky,
+            basecamp: self.basecamp,
         })
     }
 }

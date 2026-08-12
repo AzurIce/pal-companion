@@ -51,6 +51,9 @@ pub struct OwnedPal {
     /// 游戏内昵称；未命名 → None（展示时回退物种名）
     #[serde(default)]
     pub nickname: Option<String>,
+    /// 据点序号（仅同步自游戏 base 容器的帕鲁有）；1-based per dump
+    #[serde(default)]
+    pub basecamp: Option<u8>,
 }
 
 /// 帕鲁所在位置（同步自游戏的容器分组）
@@ -1101,6 +1104,7 @@ mod tests {
             favorite: 0,
             nickname: None,
             is_lucky: false,
+            basecamp: None,
         }
     }
 

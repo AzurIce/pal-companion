@@ -243,12 +243,13 @@ pub fn SyncStatusBar() -> Element {
         div { class: "sync-status",
             span { class: "sync-status-dot sync-status-dot--{dot_class}" }
             "游戏同步：{status.label()}"
-            label { class: "auto-merge-toggle",
+            label { class: "sync-switch",
                 input {
                     r#type: "checkbox",
                     checked: auto,
                     onchange: move |e| auto.set(e.checked()),
                 }
+                span { class: "sync-switch-track" }
                 "自动合并"
             }
         }
