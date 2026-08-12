@@ -753,6 +753,17 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 .dialog-title { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
 .dialog-desc { font-size: 13px; color: var(--muted-foreground); margin: 0 0 18px; }
 .dialog .form-row { margin-bottom: 14px; }
+.dialog .form-inline {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    align-items: flex-end;
+    margin-bottom: 14px;
+}
+.dialog .form-inline-item {
+    display: flex;
+    flex-direction: column;
+}
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 
 /* ---------- 配种查询页 ---------- */
@@ -1169,7 +1180,7 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 /* 持有列表：头领 / 最爱 标记 */
 .boss-tag { font-size: 11px; color: #b45309; background: #fef3c7; border-radius: var(--radius, 4px); padding: 0 4px; margin-left: 4px; }
 .fav-tag { font-size: 11px; color: #b91c1c; margin-left: 4px; }
-.boss-checkbox { width: 16px; height: 16px; }
+/* boss-checkbox 已由表单内的 3 段「头领/幸运」控件取代，此处不再需要 */
 
 /* 持有列表：昵称后的物种小字 */
 .species-sub { color: var(--muted-foreground); font-size: 12px; margin-left: 4px; }

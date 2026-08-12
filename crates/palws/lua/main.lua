@@ -707,21 +707,9 @@ local function dumpAll(reason)
         local okM, m = pcall(function() return boxUI:GetBoxMaxPageNum() end)
         okMax, maxPage = okM, (okM and type(m) == "number") and m or 1
     end
-    local t0 = os.clock()
+    -- TEMP: page-turning disabled while diagnosing the 0-pals issue.
+    -- collect the containers we have (current page only) + i=0 dbg output.
     for _, c in ipairs(containers) do collect(c) end
-    for page = 2, maxPage do
-        if boxUI == nil or not isValid(boxUI) then break end
-        local okP = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
-        if not okP then break end
-        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-        if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do
-                if isValid(c) then collect(c) end
-            end
-        end
-    end
-    if boxUI ~= nil then pcall(function() boxUI:SetPagePalBoxList(0) end) end
-    print(string.format("[Palws] dumpAll sweep: %d pages in %.3fs\n", maxPage, os.clock() - t0))
     finish()
 end
 

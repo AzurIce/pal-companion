@@ -508,8 +508,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
 
     let mut species = use_signal(|| None::<String>);
     let mut gender = use_signal(|| "male".to_string());
-    let mut is_boss = use_signal(|| false);
-    let mut is_lucky = use_signal(|| false);
+    let mut boss_lucky = use_signal(|| "none".to_string());
     let mut favorite = use_signal(|| "0".to_string());
     let mut nickname = use_signal(String::new);
     let slots: [Signal<Option<String>>; 4] = [
@@ -533,8 +532,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                         }
                         .to_string(),
                     );
-                    is_boss.set(p.is_boss);
-                    is_lucky.set(p.is_lucky);
+                    boss_lucky.set(if p.is_boss { "boss" } else if p.is_lucky { "lucky" } else { "none" });
                     favorite.set(p.favorite.min(3).to_string());
                     nickname.set(p.nickname.clone().unwrap_or_default());
                     for (i, mut s) in slots.into_iter().enumerate() {
@@ -544,8 +542,7 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                 None => {
                     species.set(None);
                     gender.set("male".to_string());
-                    is_boss.set(false);
-                    is_lucky.set(false);
+                    boss_lucky.set("none");
                     favorite.set("0".to_string());
                     nickname.set(String::new());
                     for mut s in slots {
@@ -575,8 +572,8 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                     entry.species = sp;
                     entry.gender = g;
                     entry.passives = passives;
-                    entry.is_boss = *is_boss.read();
-                    entry.is_lucky = *is_lucky.read();
+                    entry.is_boss = boss_lucky.read().as_str() == "boss";
+                    entry.is_lucky = boss_lucky.read().as_str() == "lucky";
                     entry.favorite = favorite.read().parse().unwrap_or(0);
                     let n = nickname.read().trim().to_string();
                     entry.nickname = if n.is_empty() { None } else { Some(n) };
@@ -592,8 +589,8 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                     gender: g,
                     passives,
                     group: PalGroup::Box,
-                    is_boss: *is_boss.read(),
-                    is_lucky: *is_lucky.read(),
+                    is_boss: boss_lucky.read().as_str() == "boss",
+                    is_lucky: boss_lucky.read().as_str() == "lucky",
                     favorite: favorite.read().parse().unwrap_or(0),
                     nickname: if n.is_empty() { None } else { Some(n) },
                     basecamp: None,
@@ -625,44 +622,39 @@ fn PalFormDialog(open: Signal<bool>, editing: Option<OwnedPal>) -> Element {
                     oninput: move |e| nickname.set(e.value()),
                 }
             }
-            div { class: "form-row",
-                label { class: "field-label", "性别" }
-                Segmented {
-                    options: vec![
-                        Segment { value: "male".to_string(), label: "♂ 雄性".to_string() },
-                        Segment { value: "female".to_string(), label: "♀ 雌性".to_string() },
-                    ],
-                    value: gender,
+            div { class: "form-row form-inline",
+                div { class: "form-inline-item",
+                    label { class: "field-label", "性别" }
+                    Segmented {
+                        options: vec![
+                            Segment { value: "male".to_string(), label: "♂ 雄性".to_string() },
+                            Segment { value: "female".to_string(), label: "♀ 雌性".to_string() },
+                        ],
+                        value: gender,
+                    }
                 }
-            }
-            div { class: "form-row",
-                label { class: "field-label", "头领" }
-                input {
-                    r#type: "checkbox",
-                    class: "boss-checkbox",
-                    checked: is_boss,
-                    onchange: move |e| is_boss.set(e.checked()),
+                div { class: "form-inline-item",
+                    label { class: "field-label", "头领/幸运" }
+                    Segmented {
+                        options: vec![
+                            Segment { value: "none".to_string(), label: "无".to_string() },
+                            Segment { value: "boss".to_string(), label: "头领".to_string() },
+                            Segment { value: "lucky".to_string(), label: "幸运".to_string() },
+                        ],
+                        value: boss_lucky,
+                    }
                 }
-            }
-            div { class: "form-row",
-                label { class: "field-label", "幸运" }
-                input {
-                    r#type: "checkbox",
-                    class: "boss-checkbox",
-                    checked: is_lucky,
-                    onchange: move |e| is_lucky.set(e.checked()),
-                }
-            }
-            div { class: "form-row",
-                label { class: "field-label", "最爱" }
-                Segmented {
-                    options: vec![
-                        Segment { value: "0".to_string(), label: "无".to_string() },
-                        Segment { value: "1".to_string(), label: "I".to_string() },
-                        Segment { value: "2".to_string(), label: "II".to_string() },
-                        Segment { value: "3".to_string(), label: "III".to_string() },
-                    ],
-                    value: favorite,
+                div { class: "form-inline-item",
+                    label { class: "field-label", "最爱" }
+                    Segmented {
+                        options: vec![
+                            Segment { value: "0".to_string(), label: "无".to_string() },
+                            Segment { value: "1".to_string(), label: "I".to_string() },
+                            Segment { value: "2".to_string(), label: "II".to_string() },
+                            Segment { value: "3".to_string(), label: "III".to_string() },
+                        ],
+                        value: favorite,
+                    }
                 }
             }
             div { class: "form-row",
