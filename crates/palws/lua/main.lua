@@ -671,22 +671,23 @@ local function dumpAll(reason)
         end
         return false
     end
+    -- PalBox pages are lazily-filled slots on ONE container: turn every page
+    -- (wakes the 960 slots) BEFORE dumping, so the container dump is complete
+    -- in one pass. wakeBoxPages returns after restoring page 1.
+    wakeBoxPages()
     for _, c in ipairs(containers) do collect(c) end
-    -- PalBox pages beyond page 1 are lazily-loaded containers: turn pages on
-    -- the box UI and collect any new containers that materialize.
-    local extra = dumpAllPages(collect)
     broadcastJson('{"version":1,"source":"palws","event":"' .. reason
         .. '","pals":[' .. table.concat(all, ",") .. "]}")
-    print("[Palws] dumpAll exit ok, total " .. #all .. " pals (box pages +" .. extra .. ")\n")
+    print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
 end
 
--- PalBox is paged (30 slots/page, up to 32 pages = 960). Only the current
--- page's container is materialized; other pages are loaded lazily via UI page
--- turns. Find the box UI (maxPage > 1), turn every page, and collect any
--- newly-appeared PalIndividualCharacterContainer through `collect`.
+-- PalBox is paged (30 slots/page, up to 32 pages = 960): slots beyond the
+-- current page are lazily materialized. Turning pages wakes them. We turn
+-- every page once (no FindAllOf — container set never changes), then return
+-- to page 1; the caller re-dumps the containers in one complete pass.
 -- NOTE: global (not local) — dumpAll above references it; a local declared
 -- after dumpAll would be lexically invisible (nil) at dumpAll's definition.
-function dumpAllPages(collect)
+function wakeBoxPages()
     local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
     if not (okU and type(uis) == "table") then return 0 end
     local boxUI = nil
@@ -697,27 +698,14 @@ function dumpAllPages(collect)
     if boxUI == nil then return 0 end
     local okMax, maxPage = pcall(function() return boxUI:GetBoxMaxPageNum() end)
     if not okMax or type(maxPage) ~= "number" or maxPage <= 1 then return 0 end
-    local before = 0
-    local okB, cons0 = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-    if okB and type(cons0) == "table" then before = #cons0 end
-    local extra = 0
+    local t0 = os.clock()
     for page = 2, maxPage do
         pcall(function() boxUI:ChangeNextPagePalBoxList() end)
-        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-        if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do
-                local okA, addr = pcall(function() return c:GetAddress() end)
-                if okA and collect(c) then extra = extra + 1 end
-            end
-        end
     end
     pcall(function() boxUI:SetPagePalBoxList(0) end)  -- back to page 1
-    local after = 0
-    local okA2, cons2 = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-    if okA2 and type(cons2) == "table" then after = #cons2 end
-    print(string.format("[Palws] dumpAllPages: maxPage=%d containers %d->%d\n",
-        maxPage, before, after))
-    return extra
+    print(string.format("[Palws] wakeBoxPages: %d pages turned in %.3fs\n",
+        maxPage - 1, os.clock() - t0))
+    return maxPage
 end
 
 -- ---------- deep diagnostics (F5) ----------
