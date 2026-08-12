@@ -190,7 +190,7 @@ footer.attribution { flex: none; }
     flex: none;
 }
 
-/* 头像角标：头领（左上） / 幸运（右上） / 最爱 I·II·III（右下） */
+/* 头像角标：头领/闪光（左上） / 最爱 I·II·III（右上） */
 .owned-avatar { position: relative; flex: none; }
 .owned-avatar img {
     width: 40px;
@@ -211,21 +211,18 @@ footer.attribution { flex: none; }
 .avatar-badge--boss { background: #7c3aed; color: #fff; box-shadow: 0 0 0 2px var(--card); }
 .avatar-badge--lucky { background: #f59e0b; color: #fff; box-shadow: 0 0 0 2px var(--card); }
 .avatar-badge--fav { top: -5px; right: -5px; background: var(--muted); color: var(--foreground); box-shadow: 0 0 0 2px var(--card); }
-/* 游戏图标角标（闪光/最爱） */
-.avatar-badge-img {
+/* 游戏闪光图标；提高选择器优先级，避免被头像的 40×40 规则覆盖。 */
+.owned-avatar > img.avatar-badge-img {
     position: absolute;
-    top: -6px; left: -6px;
-    width: 20px; height: 20px;
+    top: -6px;
+    left: -6px;
+    width: 20px;
+    height: 20px;
     border-radius: 6px;
     box-shadow: 0 0 0 2px var(--card);
     background: var(--card);
     object-fit: contain;
     pointer-events: none;
-}
-.avatar-badge-img--fav {
-    top: auto; left: auto;
-    bottom: -6px; right: -6px;
-    width: 18px; height: 18px;
 }
 .owned-item-nick { color: var(--foreground); }
 .owned-item-nick + .species-sub { margin-left: 0; }

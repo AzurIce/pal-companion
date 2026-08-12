@@ -351,7 +351,7 @@ pub fn OwnedSidebar() -> Element {
                                             span { class: "avatar-badge avatar-badge--boss", "👑" }
                                         }
                                         if pal.favorite > 0 {
-                                            img { class: "avatar-badge-img avatar-badge-img--fav", src: "icons/favomark.png", alt: "{fav_label}" }
+                                            span { class: "avatar-badge avatar-badge--fav", "{fav_label}" }
                                         }
                                     }
                                     div { class: "owned-item-main",
