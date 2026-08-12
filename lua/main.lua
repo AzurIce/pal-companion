@@ -694,30 +694,50 @@ local CANDIDATES = {
     "WBP_GlobalPalStorage_ForDisplay",
     "WBP_DimensionPalStorage_ForDisplay",
 }
--- NotifyOnNewObject requires the class to EXIST at registration time (docs);
--- BP widget classes may not be loaded yet at main-menu time, so registration
--- can throw. Register with visible logging and retry pending ones in pump.
-local pendingNotify = {}
-local retryCount = 0
-local function tryRegisterCandidate(cls, quiet)
+-- NotifyOnNewObject requires the FULL class path (e.g. /Script/Engine.Actor)
+-- and the class to EXIST at registration time. BP widget classes load lazily
+-- (not present at main-menu), so static registration is pointless and noisy.
+-- Instead we register dynamically once an instance is observed: resolve the
+-- class path from the instance's UClass and hook it then. Registration
+-- succeeds because the class now exists.
+local dynTried = {}    -- simple class name -> true (attempted)
+local dynHooked = {}   -- full path      -> true (registered)
+local function tryRegisterByInstance(inst)
+    local okC, clsObj = pcall(function() return inst:GetClass() end)
+    if not (okC and isValid(clsObj)) then return false end
+    local okF, full = pcall(function() return clsObj:GetFullName() end)
+    -- UClass GetFullName: "Class /Game/.../WBP_X.WBP_X_C" -> take path part
+    local path = okF and tostring(full):match("^%S+%s+(.+)$") or nil
+    if not path then return false end
+    if dynHooked[path] then return true end
     local ok, err = pcall(function()
-        NotifyOnNewObject(cls, guarded("notify-" .. cls, function(obj)
+        NotifyOnNewObject(path, guarded("notify-" .. path, function(obj)
             if isValid(obj) then
                 lastWidget = obj
                 dirty = true
-                print("[Palws] widget created: " .. cls .. "\n")
+                print("[Palws] widget created: " .. path .. "\n")
             end
         end))
     end)
-    if ok or not quiet then
-        print("[Palws] NotifyOnNewObject " .. cls .. ": "
-            .. (ok and "registered" or ("FAILED (will retry): " .. tostring(err))) .. "\n")
+    if ok then
+        dynHooked[path] = true
+        print("[Palws] NotifyOnNewObject registered: " .. path .. "\n")
+    else
+        print("[Palws] NotifyOnNewObject FAILED " .. path .. ": " .. tostring(err) .. "\n")
     end
     return ok
 end
-for _, cls in ipairs(CANDIDATES) do
-    if not tryRegisterCandidate(cls, false) then
-        pendingNotify[cls] = true
+-- lazy hook sweep: probe each candidate's class once its first instance shows
+-- up in the world; cheap FindFirstOf per pump tick until class is loaded.
+local function sweepDynamicHooks()
+    for _, cls in ipairs(CANDIDATES) do
+        if not dynTried[cls] then
+            local ok, obj = pcall(function() return FindFirstOf(cls .. "_C") end)
+            if ok and isValid(obj) then
+                dynTried[cls] = true
+                tryRegisterByInstance(obj)
+            end
+        end
     end
 end
 
@@ -803,17 +823,9 @@ local function pollTerminal()
 end
 
 local function pump()
-    -- retry pending candidate registrations (classes load lazily);
-    -- failures stay quiet except a heartbeat every ~20s
-    if next(pendingNotify) ~= nil then
-        retryCount = retryCount + 1
-        local verbose = (retryCount % 40 == 1)
-        for cls in pairs(pendingNotify) do
-            if tryRegisterCandidate(cls, not verbose) then
-                pendingNotify[cls] = nil
-            end
-        end
-    end
+    -- lazy class hooks: register NotifyOnNewObject once each candidate's class
+    -- is observed in the world (dynamic full-path registration)
+    sweepDynamicHooks()
     pcall(pollTerminal)
     if dirty then
         dirty = false
