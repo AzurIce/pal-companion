@@ -671,14 +671,51 @@ local function dumpAll(reason)
         end
         return false
     end
-    -- PalBox pages are lazily-filled slots on ONE container: turn every page
-    -- (wakes the 960 slots) BEFORE dumping, so the container dump is complete
-    -- in one pass. wakeBoxPages returns after restoring page 1.
-    wakeBoxPages()
-    for _, c in ipairs(containers) do collect(c) end
-    broadcastJson('{"version":1,"source":"palws","event":"' .. reason
-        .. '","pals":[' .. table.concat(all, ",") .. "]}")
-    print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
+    -- PalBox slots beyond the current page are lazily materialized per page.
+    -- Turn every page and collect each page's container AS WE GO (page turns
+    -- reset previously-filled slots, so dump-then-turn loses data). Async:
+    -- one page per frame tick so the game never blocks for the whole sweep.
+    local function finish()
+        broadcastJson('{"version":1,"source":"palws","event":"' .. reason
+            .. '","pals":[' .. table.concat(all, ",") .. "]}")
+        print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
+    end
+    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
+    local boxUI = nil
+    if okU and type(uis) == "table" then
+        for _, ui in ipairs(uis) do
+            local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
+            if okN and type(n) == "number" and n > 1 then boxUI = ui break end
+        end
+    end
+    if boxUI == nil then
+        for _, c in ipairs(containers) do collect(c) end
+        finish()
+        return
+    end
+    local okMax, maxPage = pcall(function() return boxUI:GetBoxMaxPageNum() end)
+    if not okMax or type(maxPage) ~= "number" or maxPage <= 1 then
+        for _, c in ipairs(containers) do collect(c) end
+        finish()
+        return
+    end
+    local page = 1
+    local step = nil
+    step = function()
+        pcall(function() boxUI:SetPagePalBoxList(page - 1) end)
+        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
+        if okC and type(cons) == "table" then
+            for _, c in ipairs(cons) do collect(c) end
+        end
+        page = page + 1
+        if page > maxPage then
+            pcall(function() boxUI:SetPagePalBoxList(0) end)  -- back to page 1
+            finish()
+        else
+            ExecuteWithDelay(40, step)  -- spread across frames
+        end
+    end
+    step()
 end
 
 -- PalBox is paged (30 slots/page, up to 32 pages = 960): slots beyond the
