@@ -15,8 +15,10 @@
 local READ_PASSIVES = true   -- RE-VERIFY on UE4SS Experimental: FName array marshaling
 local READ_GENDER   = true   -- RE-VERIFY on UE4SS Experimental (Palworld): UEnum::Names 0x48 layout
 local READ_NICKNAME = true   -- struct FString member, suspected safe
-local MAX_DUMP_PALS = 600
-local FORCE_SYNC_EXPERIMENT_ONLY = true
+local MAX_DUMP_PALS = 960
+local PALBOX_PAGE_COUNT = 32
+local PALBOX_PAGE_REQUEST_DELAY_MS = 200
+local PALBOX_REPLICATION_SETTLE_MS = 3000
 
 print("[Palws] mod loading\n")
 
@@ -631,7 +633,9 @@ local function dumpContainerPals(container, cidx)
     return pals
 end
 
-local dumpAllPages
+-- Assigned after the PlayerState RPC helpers are declared. Pump/F7 callbacks
+-- capture this forward declaration and run only after the script has loaded.
+local syncPalBoxAndDump
 
 local function dumpAll(reason)
     baseCampSeq = 0
@@ -669,50 +673,9 @@ local function dumpAll(reason)
         return false
     end
     for _, c in ipairs(containers) do collect(c) end
-    -- PalBox pages beyond page 1 are lazily-loaded containers: turn pages on
-    -- the box UI and collect any new containers that materialize.
-    local extra = dumpAllPages(collect)
     broadcastJson('{"version":1,"source":"palws","event":"' .. reason
         .. '","pals":[' .. table.concat(all, ",") .. "]}")
-    print("[Palws] dumpAll exit ok, total " .. #all .. " pals (box pages +" .. extra .. ")\n")
-end
-
--- PalBox is paged (30 slots/page, up to 32 pages = 960). Only the current
--- page's container is materialized; other pages are loaded lazily via UI page
--- turns. Find the box UI (maxPage > 1), turn every page, and collect any
--- newly-appeared PalIndividualCharacterContainer through `collect`.
-dumpAllPages = function(collect)
-    local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
-    if not (okU and type(uis) == "table") then return 0 end
-    local boxUI = nil
-    for _, ui in ipairs(uis) do
-        local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
-        if okN and type(n) == "number" and n > 1 then boxUI = ui break end
-    end
-    if boxUI == nil then return 0 end
-    local okMax, maxPage = pcall(function() return boxUI:GetBoxMaxPageNum() end)
-    if not okMax or type(maxPage) ~= "number" or maxPage <= 1 then return 0 end
-    local before = 0
-    local okB, cons0 = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-    if okB and type(cons0) == "table" then before = #cons0 end
-    local extra = 0
-    for page = 2, maxPage do
-        pcall(function() boxUI:ChangeNextPagePalBoxList() end)
-        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-        if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do
-                local okA, addr = pcall(function() return c:GetAddress() end)
-                if okA and collect(c) then extra = extra + 1 end
-            end
-        end
-    end
-    pcall(function() boxUI:SetPagePalBoxList(0) end)  -- back to page 1
-    local after = 0
-    local okA2, cons2 = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-    if okA2 and type(cons2) == "table" then after = #cons2 end
-    print(string.format("[Palws] dumpAllPages: maxPage=%d containers %d->%d\n",
-        maxPage, before, after))
-    return extra
+    print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
 end
 
 -- ---------- deep diagnostics (F5) ----------
@@ -906,13 +869,10 @@ local function pump()
     -- is observed in the world (dynamic full-path registration)
     sweepDynamicHooks()
     pcall(pollTerminal)
-    if dirty and not FORCE_SYNC_EXPERIMENT_ONLY then
+    if dirty then
         dirty = false
-        ExecuteWithDelay(1500, guarded("pump-dump", function()
-            ExecuteInGameThread(guarded("dumpAll-timer", function()
-                local okD, errD = pcall(dumpAll, "terminal-open")
-                if not okD then print("[Palws] dumpAll ERROR: " .. tostring(errD) .. "\n") end
-            end))
+        ExecuteWithDelay(1500, guarded("pump-sync", function()
+            syncPalBoxAndDump("terminal-open")
         end))
     end
     ExecuteWithDelay(500, pump)
@@ -927,14 +887,7 @@ RegisterKeyBind(Key.F6, guarded("F6", function()
 end))
 
 RegisterKeyBind(Key.F7, guarded("F7", function()
-    if FORCE_SYNC_EXPERIMENT_ONLY then
-        print("[Palws] F7 disabled during force-sync experiment\n")
-        return
-    end
-    ExecuteInGameThread(guarded("dumpAll-f7", function()
-        local okD, errD = pcall(dumpAll, "manual-f7")
-        if not okD then print("[Palws] dumpAll ERROR: " .. tostring(errD) .. "\n") end
-    end))
+    syncPalBoxAndDump("manual-f7")
 end))
 
 -- ---------- F4: runtime introspection of one real pal parameter ----------
@@ -1321,6 +1274,99 @@ local function finishForceSyncExperiment(playerState)
         okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
 end
 
+local function finishPalBoxSyncAndDump(playerState, reason)
+    print("[Palws] page-sync replication settled; scanning containers\n")
+    local okDump, dumpErr = pcall(dumpAll, reason)
+    if not okDump then
+        print("[Palws] dumpAll ERROR after page sync: " .. tostring(dumpErr) .. "\n")
+    end
+    finishForceSyncExperiment(playerState)
+end
+
+-- Production path used by terminal-open and F7. Force slot replication,
+-- explicitly request all 32 server pages, allow their OnRep callbacks to
+-- settle, then scan the single 960-slot PalBox container and broadcast once.
+syncPalBoxAndDump = function(reason)
+    if forceSyncExperiment.active then
+        print("[Palws] page-sync dump skipped: another sync is active\n")
+        return false
+    end
+
+    ExecuteInGameThread(guarded("page-sync-dump-start", function()
+        local playerState = getLocalPlayerState()
+        if not isValid(playerState) then
+            print("[Palws] page-sync dump: local PlayerState not found; using cached slots\n")
+            local okDump, dumpErr = pcall(dumpAll, reason)
+            if not okDump then print("[Palws] dumpAll ERROR: " .. tostring(dumpErr) .. "\n") end
+            return
+        end
+
+        resetForceSyncExperiment()
+        forceSyncExperiment.mode = "sync-and-dump"
+        forceSyncExperiment.active = true
+        local okEnable, enableErr = pcall(function()
+            playerState:RequestForceSyncPalBoxSlot_ToServer(true)
+        end)
+        if not okEnable then
+            forceSyncExperiment.active = false
+            print("[Palws] page-sync dump force enable FAILED: " .. tostring(enableErr)
+                .. "; using cached slots\n")
+            local okDump, dumpErr = pcall(dumpAll, reason)
+            if not okDump then print("[Palws] dumpAll ERROR: " .. tostring(dumpErr) .. "\n") end
+            return
+        end
+        print(string.format(
+            "[Palws] page-sync dump enabled; requesting pages 0..%d at %dms intervals\n",
+            PALBOX_PAGE_COUNT - 1, PALBOX_PAGE_REQUEST_DELAY_MS))
+
+        local nextPage = 0
+        local requestNextPage
+        requestNextPage = function()
+            ExecuteInGameThread(function()
+                local okStep, stepErr = pcall(function()
+                    if not forceSyncExperiment.active or not isValid(playerState) then
+                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
+                        finishPalBoxSyncAndDump(playerState, reason)
+                        return
+                    end
+
+                    local page = nextPage
+                    local okRequest, requestErr = pcall(function()
+                        playerState:RequestPalBoxSyncPage_ToServer(page)
+                    end)
+                    if okRequest then
+                        forceSyncExperiment.requestedPages = forceSyncExperiment.requestedPages + 1
+                    else
+                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
+                        print("[Palws] page-sync dump request " .. page .. " FAILED: "
+                            .. tostring(requestErr) .. "\n")
+                    end
+
+                    nextPage = nextPage + 1
+                    if nextPage < PALBOX_PAGE_COUNT then
+                        ExecuteWithDelay(PALBOX_PAGE_REQUEST_DELAY_MS, requestNextPage)
+                    else
+                        print("[Palws] page-sync dump requests sent; waiting for replication\n")
+                        ExecuteWithDelay(PALBOX_REPLICATION_SETTLE_MS,
+                            guarded("page-sync-dump-finish-delay", function()
+                                ExecuteInGameThread(guarded("page-sync-dump-finish", function()
+                                    finishPalBoxSyncAndDump(playerState, reason)
+                                end))
+                            end))
+                    end
+                end)
+                if not okStep then
+                    forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
+                    print("[Palws] page-sync dump step FAILED: " .. tostring(stepErr) .. "\n")
+                    finishPalBoxSyncAndDump(playerState, reason)
+                end
+            end)
+        end
+        requestNextPage()
+    end))
+    return true
+end
+
 local okRepHook, repHookErr = pcall(function()
     RegisterHook("/Script/Pal.PalIndividualCharacterSlot:OnRep_Parameter",
         function(Context)
@@ -1409,7 +1455,8 @@ RegisterKeyBind(Key.F10, guarded("F10", function()
             print("[Palws] page-sync force enable FAILED: " .. tostring(enableErr) .. "\n")
             return
         end
-        print("[Palws] page-sync enabled; requesting pages 0..31 at 200ms intervals\n")
+        print(string.format("[Palws] page-sync enabled; requesting pages 0..%d at %dms intervals\n",
+            PALBOX_PAGE_COUNT - 1, PALBOX_PAGE_REQUEST_DELAY_MS))
 
         local nextPage = 0
         local requestNextPage
@@ -1435,11 +1482,11 @@ RegisterKeyBind(Key.F10, guarded("F10", function()
                     end
 
                     nextPage = nextPage + 1
-                    if nextPage < 32 then
-                        ExecuteWithDelay(200, requestNextPage)
+                    if nextPage < PALBOX_PAGE_COUNT then
+                        ExecuteWithDelay(PALBOX_PAGE_REQUEST_DELAY_MS, requestNextPage)
                     else
                         print("[Palws] page-sync requests sent; waiting 3s for replication\n")
-                        ExecuteWithDelay(3000, guarded("page-sync-finish-delay", function()
+                        ExecuteWithDelay(PALBOX_REPLICATION_SETTLE_MS, guarded("page-sync-finish-delay", function()
                             ExecuteInGameThread(guarded("page-sync-finish", function()
                                 finishForceSyncExperiment(playerState)
                             end))
@@ -1469,7 +1516,7 @@ do
         "getContainers", "containerSummary", "dumpContainerPals", "dumpAll",
         "walkObjectProps", "census", "pollTerminal", "pump",
         "getLocalPlayerState", "resetForceSyncExperiment", "countForceSyncEntries",
-        "finishForceSyncExperiment",
+        "finishForceSyncExperiment", "finishPalBoxSyncAndDump", "syncPalBoxAndDump",
         "buildClassCache", "buildStructCache",
     }
     local scope = {
@@ -1489,6 +1536,8 @@ do
         resetForceSyncExperiment=resetForceSyncExperiment,
         countForceSyncEntries=countForceSyncEntries,
         finishForceSyncExperiment=finishForceSyncExperiment,
+        finishPalBoxSyncAndDump=finishPalBoxSyncAndDump,
+        syncPalBoxAndDump=syncPalBoxAndDump,
         buildClassCache=buildClassCache, buildStructCache=buildStructCache,
     }
     local fails = {}
