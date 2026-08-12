@@ -36,13 +36,13 @@ impl SyncStatus {
     }
 }
 
-/// 同步状态的全局 store：连接状态 + 待确认的帕鲁列表 + 自动合并开关 + 结果 toast。
+/// 同步状态的全局 store：连接状态 + 待确认的帕鲁列表 + 自动同步开关 + 结果 toast。
 #[derive(Debug, Clone, Copy)]
 pub struct SyncStore {
     pub status: Signal<SyncStatus>,
     pub pending: Signal<Vec<SyncedPal>>,
-    /// 自动合并开关（开启后收到同步直接入库并弹 toast）
-    pub auto_merge: Signal<bool>,
+    /// 自动同步开关（开启后收到同步直接入库并弹 toast）
+    pub auto_sync: Signal<bool>,
     /// 合并结果 toast（显示几秒后自动消失）
     pub toast: Signal<Option<String>>,
 }
@@ -159,7 +159,7 @@ pub fn use_ws_sync() {
                             match msg {
                                 Ok(Message::Text(text)) => match sync::parse_message(&text) {
                                     Ok(pals) => {
-                                        if *sync.auto_merge.peek() {
+                                        if *sync.auto_sync.peek() {
                                             // 自动同步覆盖：游戏数据为权威，直接入库（覆盖旧同步数据）
                                             let summary =
                                                 do_merge(&mut owned_pals.write(), pals, true);
@@ -237,12 +237,12 @@ pub fn SyncBanner() -> Element {
     }
 }
 
-/// 页脚状态栏左侧：连接状态 + 自动合并开关。
+/// 页脚状态栏左侧：连接状态 + 自动同步开关。
 #[component]
 pub fn SyncStatusBar() -> Element {
     let sync = use_context::<SyncStore>();
     let status = *sync.status.read();
-    let mut auto = sync.auto_merge;
+    let mut auto = sync.auto_sync;
     let dot_class = match status {
         SyncStatus::Disconnected => "off",
         SyncStatus::Connected => "on",
@@ -259,7 +259,7 @@ pub fn SyncStatusBar() -> Element {
                     onchange: move |e| auto.set(e.checked()),
                 }
                 span { class: "sync-switch-track" }
-                "自动合并"
+                "自动同步"
             }
         }
     }

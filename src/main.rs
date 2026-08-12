@@ -99,11 +99,11 @@ fn App() -> Element {
         open: planner_side_open,
     });
     // 游戏同步：状态 store + WebSocket 客户端（本地 mod 未启动时静默重试）
-    let auto_merge = storage::use_persistent("palcompanion_auto_merge", || false);
+    let auto_sync = storage::use_persistent("palcompanion_auto_sync", || false);
     use_context_provider(|| sync_client::SyncStore {
         status: Signal::new(sync_client::SyncStatus::Disconnected),
         pending: Signal::new(Vec::new()),
-        auto_merge,
+        auto_sync,
         toast: Signal::new(None),
     });
     sync_client::use_ws_sync();
@@ -160,7 +160,7 @@ fn Navbar() -> Element {
                 }
             }
             footer { class: "attribution statusbar",
-                // 页脚改为状态栏：左侧同步状态 + 自动合并开关，右侧素材说明
+                // 页脚改为状态栏：左侧同步状态 + 自动同步开关，右侧素材说明
                 sync_client::SyncStatusBar {}
                 span { class: "attribution-text",
                     "数据来自 "
