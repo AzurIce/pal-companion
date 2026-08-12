@@ -188,21 +188,21 @@ fn dedupe_key(p: &OwnedPal) -> (String, Gender, Vec<String>) {
 /// - 按 (species, gender, 排序后 passives) 去重，已存在（含 incoming 内部重复）的跳过；
 /// - 新增条目 id 沿用现有惯例：当前最大 id + 1 递增（传入的 id 会被覆盖）。
 ///
-/// 自动同步覆盖：游戏数据为权威，全量替换此前同步来的帕鲁（synced=true），
-/// 保留手动添加的（synced=false）。返回新写入的数量。
+/// 自动同步替换：游戏数据为唯一真相，整个列表重建为本次同步内容
+/// （手动添加的帕鲁一并清除）。返回写入的数量。
 pub fn overwrite_owned(existing: &mut Vec<OwnedPal>, incoming: Vec<OwnedPal>) -> usize {
-    let before = existing.len();
-    existing.retain(|p| !p.synced);
-    let removed = before - existing.len();
-    let mut next = existing.iter().map(|p| p.id).max().unwrap_or(0) + 1;
-    for mut p in incoming {
-        p.id = next;
-        next += 1;
-        p.synced = true;
-        existing.push(p);
-    }
-    let _ = removed;
-    existing.len() - before + removed
+    let n = incoming.len();
+    let rebuilt: Vec<OwnedPal> = incoming
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut p)| {
+            p.id = i as u64 + 1;
+            p.synced = true;
+            p
+        })
+        .collect();
+    *existing = rebuilt;
+    n
 }
 
 /// 返回实际新增的数量。

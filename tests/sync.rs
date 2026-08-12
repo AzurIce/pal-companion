@@ -231,3 +231,23 @@ fn merge_refreshes_group_on_resync() {
     assert_eq!(existing.len(), 1);
     assert_eq!(existing[0].group, PalGroup::Party);
 }
+
+#[test]
+fn overwrite_replaces_entire_list() {
+    // 全量替换：手动添加的（synced=false）也会被清掉，列表 = 本次同步内容
+    let mut existing = vec![
+        owned(1, "Foxparks", Gender::Male, &[]), // 手动
+        owned(2, "Lamball", Gender::Female, &[]),
+    ];
+    existing[0].synced = false;
+    existing[1].synced = true;
+    let incoming = vec![
+        owned(0, "Chikipi", Gender::Male, &[]),
+        owned(0, "Pengullet", Gender::Female, &[]),
+    ];
+    let n = sync::overwrite_owned(&mut existing, incoming);
+    assert_eq!(n, 2);
+    assert_eq!(existing.len(), 2, "手动添加的也应被替换");
+    assert!(existing.iter().all(|p| p.synced));
+    assert!(existing.iter().all(|p| p.id >= 1));
+}

@@ -114,7 +114,7 @@ pub fn do_merge(pals: &mut Vec<OwnedPal>, synced: Vec<SyncedPal>, overwrite: boo
     );
 
     let mut msg = if overwrite {
-        format!("已同步覆盖 {added} 只")
+        format!("已同步替换 {added} 只")
     } else {
         format!("已导入 {added} 只")
     };
