@@ -725,15 +725,30 @@ local function dumpAll(reason)
     end
     local t0 = os.clock()
     for _, c in ipairs(containers) do collect(c) end
+    -- Page turns wake more slots on the SAME box container, so seen-dedup
+    -- would skip it. Force a re-dump per page and dedup at the pal level.
+    local seenPal = {}
+    local function collectDup(c)
+        if not isValid(c) then return end
+        local okD, res = pcall(dumpContainerPals, c, cidx + 1)
+        if okD and type(res) == "table" then
+            for _, pj in ipairs(res) do
+                if not seenPal[pj] then
+                    seenPal[pj] = true
+                    all[#all + 1] = pj
+                end
+            end
+        elseif not okD then
+            print("[Palws] page-dump ERROR: " .. tostring(res) .. "\n")
+        end
+    end
     for page = 2, maxPage do
         if boxUI == nil or not isValid(boxUI) then break end
         local okP = pcall(function() boxUI:ChangeNextPagePalBoxList() end)
         if not okP then break end
         local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
         if okC and type(cons) == "table" then
-            for _, c in ipairs(cons) do
-                if isValid(c) then collect(c) end
-            end
+            for _, c in ipairs(cons) do collectDup(c) end
         end
     end
     if boxUI ~= nil then pcall(function() boxUI:SetPagePalBoxList(0) end) end
