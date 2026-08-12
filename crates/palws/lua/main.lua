@@ -1240,6 +1240,117 @@ RegisterKeyBind(Key.F8, guarded("F8", function()
     broadcastJson(json)
 end))
 
+-- ---------- F9: server-side PalBox replication experiment ----------
+-- Ask the owning PlayerState to force PalBox slot replication, then observe
+-- the native OnRep callback for five seconds. This deliberately does not read
+-- pal fields, scan the 960-slot container, turn pages, or broadcast a payload.
+local forceSyncExperiment = {
+    active = false,
+    callbacks = 0,
+    uniqueSlots = {},
+    pages = {},
+    minSlot = nil,
+    maxSlot = nil,
+}
+
+local function getLocalPlayerState()
+    local ok, controllers = pcall(function() return FindAllOf("PlayerController") end)
+    if not (ok and type(controllers) == "table") then return nil end
+    for _, controller in ipairs(controllers) do
+        if isValid(controller) then
+            local okLocal, isLocal = pcall(function()
+                if controller.IsLocalPlayerController ~= nil then
+                    return controller:IsLocalPlayerController()
+                end
+                return controller:IsPlayerController()
+            end)
+            if okLocal and isLocal then
+                local okState, state = pcall(function() return controller.PlayerState end)
+                if okState and isValid(state) then return state end
+            end
+        end
+    end
+    return nil
+end
+
+local function resetForceSyncExperiment()
+    forceSyncExperiment.callbacks = 0
+    forceSyncExperiment.uniqueSlots = {}
+    forceSyncExperiment.pages = {}
+    forceSyncExperiment.minSlot = nil
+    forceSyncExperiment.maxSlot = nil
+end
+
+local okRepHook, repHookErr = pcall(function()
+    RegisterHook("/Script/Pal.PalIndividualCharacterSlot:OnRep_Parameter",
+        guarded("force-sync-onrep", function(Context)
+            if not forceSyncExperiment.active then return end
+            local okSlot, slot = pcall(function() return Context:get() end)
+            if not (okSlot and isValid(slot)) then return end
+
+            forceSyncExperiment.callbacks = forceSyncExperiment.callbacks + 1
+            local okAddr, addr = pcall(function() return slot:GetAddress() end)
+            if okAddr then forceSyncExperiment.uniqueSlots[tostring(addr)] = true end
+
+            local okIndex, index = pcall(function() return slot:GetSlotIndex() end)
+            if okIndex and type(index) == "number" and index >= 0 then
+                local page = math.floor(index / 30)
+                forceSyncExperiment.pages[page] = true
+                if forceSyncExperiment.minSlot == nil or index < forceSyncExperiment.minSlot then
+                    forceSyncExperiment.minSlot = index
+                end
+                if forceSyncExperiment.maxSlot == nil or index > forceSyncExperiment.maxSlot then
+                    forceSyncExperiment.maxSlot = index
+                end
+            end
+        end))
+end)
+print("[Palws] force-sync OnRep hook: "
+    .. (okRepHook and "ok" or ("FAILED " .. tostring(repHookErr))) .. "\n")
+
+RegisterKeyBind(Key.F9, guarded("F9", function()
+    if forceSyncExperiment.active then
+        print("[Palws] force-sync experiment already active\n")
+        return
+    end
+    ExecuteInGameThread(guarded("force-sync-start", function()
+        local playerState = getLocalPlayerState()
+        if not isValid(playerState) then
+            print("[Palws] force-sync: local PlayerState not found\n")
+            return
+        end
+
+        resetForceSyncExperiment()
+        forceSyncExperiment.active = true
+        local okEnable, enableErr = pcall(function()
+            playerState:RequestForceSyncPalBoxSlot_ToServer(true)
+        end)
+        if not okEnable then
+            forceSyncExperiment.active = false
+            print("[Palws] force-sync enable FAILED: " .. tostring(enableErr) .. "\n")
+            return
+        end
+        print("[Palws] force-sync enabled; observing OnRep_Parameter for 5s\n")
+
+        ExecuteWithDelay(5000, guarded("force-sync-finish", function()
+            local okDisable, disableErr = pcall(function()
+                if isValid(playerState) then
+                    playerState:RequestForceSyncPalBoxSlot_ToServer(false)
+                end
+            end)
+            forceSyncExperiment.active = false
+            print(string.format(
+                "[Palws] force-sync result: callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s disable=%s\n",
+                forceSyncExperiment.callbacks,
+                countTable(forceSyncExperiment.uniqueSlots),
+                countTable(forceSyncExperiment.pages),
+                tostring(forceSyncExperiment.minSlot),
+                tostring(forceSyncExperiment.maxSlot),
+                okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
+        end))
+    end))
+end))
+
 -- ---------- load-time self-check: every critical function must be callable ----------
 do
     local required = {
@@ -1251,6 +1362,7 @@ do
         "readField", "buildPalJson", "slotParam", "probeSlot",
         "getContainers", "containerSummary", "dumpContainerPals", "dumpAll",
         "walkObjectProps", "census", "pollTerminal", "pump",
+        "getLocalPlayerState", "resetForceSyncExperiment",
         "buildClassCache", "buildStructCache",
     }
     local scope = {
@@ -1266,6 +1378,8 @@ do
         getContainers=getContainers, containerSummary=containerSummary,
         dumpContainerPals=dumpContainerPals, dumpAll=dumpAll,
         walkObjectProps=walkObjectProps, census=census, pollTerminal=pollTerminal, pump=pump,
+        getLocalPlayerState=getLocalPlayerState,
+        resetForceSyncExperiment=resetForceSyncExperiment,
         buildClassCache=buildClassCache, buildStructCache=buildStructCache,
     }
     local fails = {}
