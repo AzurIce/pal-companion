@@ -582,37 +582,20 @@ pub(super) fn solve(
     };
     let mut solver = Solver::new(db, owned, desired_passives, pins);
     let desired_count = solver.desired.len();
-    if pins.is_empty() {
-        if let Some(best_owned) = solver.states[target_idx]
-            .iter()
-            .filter(|state| state.is_owned() && state.mask.count_ones() as usize == desired_count)
-            .min_by_key(|state| candidate_rank(state, desired_count))
-            .cloned()
-        {
-            return Ok(solver.into_plan(best_owned));
-        }
-    }
     solver.expand(target_idx);
     let target_states = &solver.states[target_idx];
     let compliant: Vec<_> = target_states
         .iter()
-        .filter(|state| {
-            solver.pins_satisfied(state)
-                && (!state.is_owned() || state.mask.count_ones() as usize == desired_count)
-        })
+        .filter(|state| !state.is_owned() && solver.pins_satisfied(state))
         .collect();
     let candidates: Vec<_> = if !compliant.is_empty() {
         compliant
     } else {
         let fallback: Vec<_> = target_states
             .iter()
-            .filter(|state| !state.is_owned() || state.mask.count_ones() as usize == desired_count)
+            .filter(|state| !state.is_owned())
             .collect();
-        if fallback.is_empty() {
-            target_states.iter().collect()
-        } else {
-            fallback
-        }
+        fallback
     };
     let Some(best) = candidates
         .into_iter()

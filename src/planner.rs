@@ -827,6 +827,9 @@ pub fn plan(
     plan_with_pins(db, owned, target, desired_passives, &HashMap::new())
 }
 
+// The root always represents a newly bred target. Owned pals, including
+// instances of the target species, are inputs rather than zero-breeding results.
+
 /// 带钉选亲本对（物种 → 无序亲本对）的规划。
 ///
 /// 每只已持有帕鲁以具体 ID、性别和被动池作为独立状态；同一物种保留
@@ -1229,13 +1232,17 @@ mod tests {
     }
 
     #[test]
-    fn target_already_owned_is_trivial() {
+    fn target_already_owned_still_requires_a_breeding_plan() {
         let db = sample_db();
-        let owned = vec![owned(7, "A", Gender::Male, &[])];
+        let owned = vec![
+            owned(7, "A", Gender::Male, &[]),
+            owned(8, "A", Gender::Female, &[]),
+        ];
         let plan = plan(&db, &owned, "A", &[]).unwrap();
-        assert_eq!(plan.total_breedings, 0);
-        assert_eq!(plan.generations, 0);
-        assert_eq!(plan.used_owned, vec![7]);
+        assert!(matches!(plan.root.source, PlanSource::Bred { .. }));
+        assert_eq!(plan.total_breedings, 1);
+        assert_eq!(plan.generations, 1);
+        assert_eq!(plan.used_owned, vec![7, 8]);
     }
 
     #[test]
@@ -1412,9 +1419,9 @@ mod tests {
         assert_eq!(plan.total_breedings, 1);
     }
 
-    /// 已持有目标且单只覆盖全部期望 → 平凡结果（0 次配种）。
+    /// 已持有目标且单只覆盖全部期望，也必须返回新目标的配种路线。
     #[test]
-    fn owned_target_with_all_desired_is_trivial() {
+    fn owned_target_with_all_desired_still_plans_breeding() {
         let db = sample_db();
         let owned = vec![
             owned(1, "A", Gender::Male, &[]),
@@ -1428,8 +1435,8 @@ mod tests {
             &["lucky".to_string(), "brave".to_string()],
         )
         .unwrap();
-        assert_eq!(plan.total_breedings, 0);
-        assert_eq!(plan.used_owned, vec![3]);
+        assert!(matches!(plan.root.source, PlanSource::Bred { .. }));
+        assert!(plan.total_breedings > 0);
     }
 
     /// 钉选物种没有出现在最终路径时，不得被误认为已经满足；
@@ -1449,16 +1456,15 @@ mod tests {
         assert_eq!(plan.used_owned, vec![1, 2]);
     }
 
-    /// 钉选不可满足时，回退候选也必须包含已经满足目标的库存个体。
+    /// 钉选不可满足且没有配种路线时，不得用库存目标冒充求解结果。
     #[test]
-    fn impossible_pin_falls_back_to_owned_target() {
+    fn impossible_pin_does_not_fall_back_to_owned_target() {
         let db = sample_db();
         let owned = vec![owned(3, "C", Gender::Female, &["lucky"])];
         let mut pins = HashMap::new();
         pins.insert("C".to_string(), ("A".to_string(), "B".to_string()));
-        let plan = plan_with_pins(&db, &owned, "C", &["lucky".to_string()], &pins).unwrap();
-        assert_eq!(plan.total_breedings, 0);
-        assert_eq!(plan.used_owned, vec![3]);
+        let err = plan_with_pins(&db, &owned, "C", &["lucky".to_string()], &pins).unwrap_err();
+        assert!(matches!(err, PlanError::Unreachable { .. }));
     }
 
     /// 覆盖优先：便宜但不带被动的路径应让位于多一步但全覆盖的路径。
