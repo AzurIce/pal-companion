@@ -1,57 +1,86 @@
-//! 本地 WebSocket 同步协议：消息解析与"我的帕鲁"去重合并（纯逻辑，不依赖 WASM）。
+//! 本地 WebSocket 同步协议：typed envelope 解析与"我的帕鲁"合并（纯逻辑，不依赖 WASM）。
 //!
-//! 消息格式（mod 端推送）：
+//! 服务端（mod）推送的每条消息都符合统一 envelope：
 //! ```json
-//! {"version":1,"source":"palws","pals":[
-//!   {"species":"PinkCat","gender":"male","passives":["Brave"],"nickname":"...","level":12}
-//! ]}
+//! {"protocol":"palws","version":1,"type":"snapshot","id":"...","request_id":"...",
+//!  "seq":42,"timestamp_ms":1786595000000,"payload":{...}}
 //! ```
+//!
+//! v1 只支持 `snapshot` 的 `mode: "replace"`：网页收到后按"全量替换"重建
+//! 同步列表（`synced=true` 的旧条目全部替换，`synced=false` 的手工条目保留）。
 
 use crate::planner::{Gender, OwnedPal, PalGroup};
 use serde::Deserialize;
 
-/// 协议版本，不匹配的消息整体忽略
+/// 协议名与主版本，不匹配的消息整体忽略。
+pub const PROTOCOL_NAME: &str = "palws";
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// 帕鲁数组；单只解析失败（如字段类型完全对不上）只跳过该只，不影响整条消息
+/// 一条服务端事件（envelope 头已解析、校验，payload 按类型分发）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ServerEvent {
+    Hello {
+        server_version: String,
+        capabilities: Vec<String>,
+        clients: usize,
+        sync_state: String,
+    },
+    SyncStatus {
+        request_id: Option<String>,
+        phase: String,
+        requested_pages: u32,
+        total_pages: u32,
+        trigger: String,
+    },
+    Snapshot {
+        request_id: Option<String>,
+        seq: u64,
+        mode: String,
+        pals: Vec<SyncedPal>,
+        stats: SnapshotStats,
+    },
+    Log {
+        request_id: Option<String>,
+        level: String,
+        source: String,
+        message: String,
+    },
+    Error {
+        request_id: Option<String>,
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+    Pong {
+        echo_id: String,
+    },
+    Unknown {
+        mtype: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SnapshotStats {
+    pub total: u32,
+    pub requested_pages: u32,
+    pub request_errors: u32,
+    pub containers: u32,
+}
+
 #[derive(Debug, Deserialize)]
-struct SyncMessage {
-    version: u32,
-    /// 来源标识（如 "palws"），仅记录不强制校验
+struct Envelope {
     #[serde(default)]
-    #[allow(dead_code)]
-    source: String,
-    #[serde(default, deserialize_with = "skip_bad_pals")]
-    pals: Vec<SyncedPal>,
-}
-
-/// 逐只容错反序列化：解析失败的条目打 console 日志（WASM）后丢弃。
-fn skip_bad_pals<'de, D>(de: D) -> Result<Vec<SyncedPal>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let raw = Vec::<serde_json::Value>::deserialize(de)?;
-    Ok(raw
-        .into_iter()
-        .filter_map(|v| match serde_json::from_value::<SyncedPal>(v) {
-            Ok(p) => Some(p),
-            Err(_e) => {
-                #[cfg(target_arch = "wasm32")]
-                web_sys::console::warn_1(
-                    &wasm_bindgen::JsValue::from_str(&format!("同步条目解析失败已跳过：{_e}")),
-                );
-                None
-            }
-        })
-        .collect())
-}
-
-/// null 当空数组（mod 可能给无被动的帕鲁输出 `"passives": null`）。
-fn null_as_empty<'de, D>(de: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<Vec<String>>::deserialize(de)?.unwrap_or_default())
+    protocol: Option<String>,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(rename = "type", default)]
+    mtype: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    payload: Option<serde_json::Value>,
 }
 
 /// mod 推送的一只帕鲁。`species`/`passives` 为 internal_name；`nickname`/`level` 目前仅透传不使用。
@@ -86,6 +115,14 @@ pub struct SyncedPal {
     pub group: Option<String>,
 }
 
+/// null 当空数组。
+fn null_as_empty<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(de)?.unwrap_or_default())
+}
+
 /// null 当空串。
 fn null_as_empty_string<'de, D>(de: D) -> Result<String, D::Error>
 where
@@ -95,7 +132,7 @@ where
 }
 
 impl SyncedPal {
-    /// 转成 OwnedPal 草稿（id 为 0，由 merge_owned 重新分配）；
+    /// 转成 OwnedPal 草稿（id 为 0，由合并方重新分配）；
     /// 物种缺失或性别 unknown 返回 None（该只跳过——OwnedPal 没有未知性别）。
     /// 注意：不做物种/被动有效性校验，那是合并方（sync_client）的职责。
     pub fn to_owned_draft(&self) -> Option<OwnedPal> {
@@ -143,7 +180,9 @@ pub fn strip_boss_prefix(species: &str) -> &str {
 pub enum SyncError {
     /// JSON 解析失败
     Parse(String),
-    /// 协议版本不匹配（消息被忽略）
+    /// 协议名不匹配
+    UnsupportedProtocol(String),
+    /// 协议版本不匹配
     UnsupportedVersion(u32),
 }
 
@@ -151,6 +190,7 @@ impl std::fmt::Display for SyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SyncError::Parse(e) => write!(f, "同步消息解析失败：{e}"),
+            SyncError::UnsupportedProtocol(p) => write!(f, "同步协议不支持：{p}"),
             SyncError::UnsupportedVersion(v) => {
                 write!(f, "同步协议版本不支持：{v}（期望 {PROTOCOL_VERSION}）")
             }
@@ -158,14 +198,157 @@ impl std::fmt::Display for SyncError {
     }
 }
 
-/// 解析一条同步消息；版本不匹配返回 UnsupportedVersion（调用方打日志后忽略）。
-pub fn parse_message(text: &str) -> Result<Vec<SyncedPal>, SyncError> {
-    let msg: SyncMessage =
-        serde_json::from_str(text).map_err(|e| SyncError::Parse(e.to_string()))?;
-    if msg.version != PROTOCOL_VERSION {
-        return Err(SyncError::UnsupportedVersion(msg.version));
+fn parse_pals(payload: &serde_json::Value) -> Vec<SyncedPal> {
+    let Some(arr) = payload.get("pals").and_then(|p| p.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|v| match serde_json::from_value::<SyncedPal>(v.clone()) {
+            Ok(p) => Some(p),
+            Err(_e) => {
+                #[cfg(target_arch = "wasm32")]
+                web_sys::console::warn_1(
+                    &wasm_bindgen::JsValue::from_str(&format!("同步条目解析失败已跳过：{_e}")),
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_stats(payload: &serde_json::Value) -> SnapshotStats {
+    let s = payload.get("stats").and_then(|s| s.as_object());
+    SnapshotStats {
+        total: s.and_then(|s| s.get("total")).and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        requested_pages: s
+            .and_then(|s| s.get("requested_pages"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        request_errors: s
+            .and_then(|s| s.get("request_errors"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        containers: s
+            .and_then(|s| s.get("containers"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
     }
-    Ok(msg.pals)
+}
+
+/// 解析一条服务端消息；协议/版本不匹配返回 SyncError（调用方打日志后忽略）。
+pub fn parse_server_message(text: &str) -> Result<ServerEvent, SyncError> {
+    let env: Envelope =
+        serde_json::from_str(text).map_err(|e| SyncError::Parse(e.to_string()))?;
+    if env.protocol.as_deref() != Some(PROTOCOL_NAME) {
+        return Err(SyncError::UnsupportedProtocol(
+            env.protocol.unwrap_or_default(),
+        ));
+    }
+    if let Some(v) = env.version {
+        if v != PROTOCOL_VERSION {
+            return Err(SyncError::UnsupportedVersion(v));
+        }
+    }
+    let payload = env.payload.unwrap_or(serde_json::Value::Null);
+    let ev = match env.mtype.as_str() {
+        "server.hello" => ServerEvent::Hello {
+            server_version: payload
+                .get("server_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            capabilities: payload
+                .get("capabilities")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            clients: payload.get("clients").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+            sync_state: payload
+                .get("sync_state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("idle")
+                .to_string(),
+        },
+        "sync.status" => ServerEvent::SyncStatus {
+            request_id: env.request_id.clone(),
+            phase: payload
+                .get("phase")
+                .and_then(|v| v.as_str())
+                .unwrap_or("idle")
+                .to_string(),
+            requested_pages: payload
+                .get("requested_pages")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            total_pages: payload
+                .get("total_pages")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            trigger: payload
+                .get("trigger")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "snapshot" => ServerEvent::Snapshot {
+            request_id: env.request_id.clone(),
+            seq: env.seq.unwrap_or(0),
+            mode: payload
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("replace")
+                .to_string(),
+            pals: parse_pals(&payload),
+            stats: parse_stats(&payload),
+        },
+        "log" => ServerEvent::Log {
+            request_id: env.request_id.clone(),
+            level: payload
+                .get("level")
+                .and_then(|v| v.as_str())
+                .unwrap_or("info")
+                .to_string(),
+            source: payload
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("lua")
+                .to_string(),
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        "error" => ServerEvent::Error {
+            request_id: env.request_id.clone(),
+            code: payload
+                .get("code")
+                .and_then(|v| v.as_str())
+                .unwrap_or("error")
+                .to_string(),
+            message: payload
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            retryable: payload.get("retryable").and_then(|v| v.as_bool()).unwrap_or(false),
+        },
+        "pong" => ServerEvent::Pong {
+            echo_id: payload
+                .get("echo_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        },
+        other => ServerEvent::Unknown {
+            mtype: other.to_string(),
+        },
+    };
+    Ok(ev)
 }
 
 /// 性别字段映射；"unknown" 及其他值返回 None（该只跳过——OwnedPal 没有未知性别）。
@@ -177,64 +360,64 @@ pub fn parse_gender(s: &str) -> Option<Gender> {
     }
 }
 
-/// 去重键：物种 + 性别 + 排序后的被动列表。
-fn dedupe_key(p: &OwnedPal) -> (String, Gender, Vec<String>) {
-    let mut passives = p.passives.clone();
-    passives.sort();
-    (p.species.clone(), p.gender, passives)
+// ---------------------------------------------------------------------------
+// client -> server 请求构造
+// ---------------------------------------------------------------------------
+
+pub fn client_hello_json(client_version: &str) -> String {
+    serde_json::json!({
+        "protocol": PROTOCOL_NAME,
+        "version": PROTOCOL_VERSION,
+        "type": "client.hello",
+        "id": "hello-1",
+        "payload": {"client": "pal-companion", "client_version": client_version},
+    })
+    .to_string()
 }
 
-/// 把同步来的帕鲁合并进现有列表：
-/// - 按 (species, gender, 排序后 passives) 去重，已存在（含 incoming 内部重复）的跳过；
-/// - 新增条目 id 沿用现有惯例：当前最大 id + 1 递增（传入的 id 会被覆盖）。
-///
-/// 自动同步替换：游戏数据为唯一真相，整个列表重建为本次同步内容
-/// （手动添加的帕鲁一并清除）。返回写入的数量。
-pub fn overwrite_owned(existing: &mut Vec<OwnedPal>, incoming: Vec<OwnedPal>) -> usize {
-    let n = incoming.len();
-    let rebuilt: Vec<OwnedPal> = incoming
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut p)| {
-            p.id = i as u64 + 1;
-            p.synced = true;
-            p
-        })
+pub fn snapshot_request_json(id: &str) -> String {
+    serde_json::json!({
+        "protocol": PROTOCOL_NAME,
+        "version": PROTOCOL_VERSION,
+        "type": "snapshot.request",
+        "id": id,
+        "payload": {},
+    })
+    .to_string()
+}
+
+pub fn ping_json(id: &str) -> String {
+    serde_json::json!({
+        "protocol": PROTOCOL_NAME,
+        "version": PROTOCOL_VERSION,
+        "type": "ping",
+        "id": id,
+        "payload": {},
+    })
+    .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// 合并语义
+// ---------------------------------------------------------------------------
+
+/// v1 推荐语义：全量替换"同步条目"，保留"手工条目"。
+/// `synced=true` 的旧条目全部移除；`synced=false` 的手工条目保留，incoming 追加其后。
+/// 返回写入（incoming）的数量。
+pub fn replace_synced(existing: &mut Vec<OwnedPal>, incoming: Vec<OwnedPal>) -> usize {
+    let mut manual: Vec<OwnedPal> = existing
+        .iter()
+        .filter(|p| !p.synced)
+        .cloned()
         .collect();
-    *existing = rebuilt;
-    n
-}
-
-/// 返回实际新增的数量。
-pub fn merge_owned(existing: &mut Vec<OwnedPal>, incoming: Vec<OwnedPal>) -> usize {
-    let mut seen: std::collections::HashSet<_> = existing.iter().map(dedupe_key).collect();
-    let mut next = existing.iter().map(|p| p.id).max().unwrap_or(0) + 1;
-    let mut added = 0;
+    let mut next = manual.iter().map(|p| p.id).max().unwrap_or(0) + 1;
+    let n = incoming.len();
     for mut p in incoming {
-        let key = dedupe_key(&p);
-        if seen.insert(key.clone()) {
-            p.id = next;
-            next += 1;
-            existing.push(p);
-            added += 1;
-        } else if let Some(old) = existing.iter_mut().find(|o| dedupe_key(o) == key) {
-            // 同一只帕鲁再次同步：只刷新位置/头领/最爱标记（会变动）
-            if old.group != p.group {
-                old.group = p.group;
-            }
-            if old.is_boss != p.is_boss {
-                old.is_boss = p.is_boss;
-            }
-            if old.favorite != p.favorite {
-                old.favorite = p.favorite;
-            }
-            if old.is_lucky != p.is_lucky {
-                old.is_lucky = p.is_lucky;
-            }
-            if old.nickname != p.nickname {
-                old.nickname = p.nickname.clone();
-            }
-        }
+        p.id = next;
+        next += 1;
+        p.synced = true;
+        manual.push(p);
     }
-    added
+    *existing = manual;
+    n
 }

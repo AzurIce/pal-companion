@@ -1,4 +1,4 @@
-//! WebSocket 同步的纯逻辑回归：消息解析（版本/字段容错）与去重合并。
+//! WebSocket 同步的纯逻辑回归：envelope 解析（版本/协议/字段容错）与合并语义。
 
 #[path = "../src/breeding.rs"]
 mod breeding;
@@ -8,7 +8,7 @@ mod planner;
 mod sync;
 
 use planner::{Gender, OwnedPal, PalGroup};
-use sync::{SyncError, SyncedPal};
+use sync::{ServerEvent, SnapshotStats, SyncError, SyncedPal};
 
 fn owned(id: u64, species: &str, gender: Gender, passives: &[&str]) -> OwnedPal {
     OwnedPal {
@@ -22,65 +22,172 @@ fn owned(id: u64, species: &str, gender: Gender, passives: &[&str]) -> OwnedPal 
         nickname: None,
         is_lucky: false,
         basecamp: None,
-            synced: false,
+        synced: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// envelope 解析
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_hello() {
+    let text = r#"{"protocol":"palws","version":1,"type":"server.hello","id":"srv-1","seq":1,
+        "payload":{"server_version":"palws-0.1.0","capabilities":["snapshot","snapshot.request"],
+        "clients":1,"sync_state":"idle"}}"#;
+    let ev = sync::parse_server_message(text).unwrap();
+    assert_eq!(
+        ev,
+        ServerEvent::Hello {
+            server_version: "palws-0.1.0".to_string(),
+            capabilities: vec!["snapshot".to_string(), "snapshot.request".to_string()],
+            clients: 1,
+            sync_state: "idle".to_string(),
+        }
+    );
+}
+
+#[test]
+fn parse_sync_status() {
+    let text = r#"{"protocol":"palws","version":1,"type":"sync.status","id":"lua-1","request_id":"req-7","seq":2,
+        "payload":{"phase":"requesting","requested_pages":12,"total_pages":32,"trigger":"web"}}"#;
+    let ev = sync::parse_server_message(text).unwrap();
+    assert_eq!(
+        ev,
+        ServerEvent::SyncStatus {
+            request_id: Some("req-7".to_string()),
+            phase: "requesting".to_string(),
+            requested_pages: 12,
+            total_pages: 32,
+            trigger: "web".to_string(),
+        }
+    );
+}
+
+#[test]
+fn parse_snapshot() {
+    let text = r#"{"protocol":"palws","version":1,"type":"snapshot","id":"lua-2","request_id":"req-7","seq":9,
+        "payload":{"mode":"replace","pals":[
+            {"species":"PinkCat","gender":"male","passives":["Brave"],"nickname":"喵喵","level":12},
+            {"species":"SheepBall","gender":"female"},
+            {"species":"Foxparks","gender":"male","passives":null,"level":"oops"}
+        ],"stats":{"total":2,"requested_pages":32,"request_errors":0,"containers":5}}}"#;
+    let ev = sync::parse_server_message(text).unwrap();
+    match ev {
+        ServerEvent::Snapshot {
+            request_id,
+            seq,
+            mode,
+            pals,
+            stats,
+        } => {
+            assert_eq!(request_id, Some("req-7".to_string()));
+            assert_eq!(seq, 9);
+            assert_eq!(mode, "replace");
+            // 坏条目（level 为字符串）被跳过
+            assert_eq!(pals.len(), 2);
+            assert_eq!(pals[0].species, Some("PinkCat".to_string()));
+            assert_eq!(
+                stats,
+                SnapshotStats {
+                    total: 2,
+                    requested_pages: 32,
+                    request_errors: 0,
+                    containers: 5,
+                }
+            );
+        }
+        _ => panic!("expected snapshot"),
     }
 }
 
 #[test]
-fn parse_valid_message() {
-    let text = r#"{"version":1,"source":"palws","pals":[
-        {"species":"PinkCat","gender":"male","passives":["Brave"],"nickname":"喵喵","level":12},
-        {"species":"SheepBall","gender":"female"}
-    ]}"#;
-    let pals = sync::parse_message(text).unwrap();
-    assert_eq!(pals.len(), 2);
+fn parse_log_error_pong() {
+    let log = r#"{"protocol":"palws","version":1,"type":"log","id":"lua-1","request_id":"req-7",
+        "payload":{"level":"warn","source":"lua","message":"page 3 failed"}}"#;
     assert_eq!(
-        pals[0],
-        SyncedPal {
-            species: Some("PinkCat".to_string()),
-            gender: "male".to_string(),
-            passives: vec!["Brave".to_string()],
-            nickname: Some("喵喵".to_string()),
-            level: Some(12),
-            ..Default::default()
+        sync::parse_server_message(log).unwrap(),
+        ServerEvent::Log {
+            request_id: Some("req-7".to_string()),
+            level: "warn".to_string(),
+            source: "lua".to_string(),
+            message: "page 3 failed".to_string(),
         }
     );
-    // 可选字段缺省
-    assert_eq!(pals[1].passives, Vec::<String>::new());
-    assert_eq!(pals[1].nickname, None);
-    assert_eq!(pals[1].level, None);
+
+    let err = r#"{"protocol":"palws","version":1,"type":"error","id":"srv-2","request_id":"req-7",
+        "payload":{"code":"player-state-unavailable","message":"当前未进入可同步的游戏世界","retryable":true}}"#;
+    assert_eq!(
+        sync::parse_server_message(err).unwrap(),
+        ServerEvent::Error {
+            request_id: Some("req-7".to_string()),
+            code: "player-state-unavailable".to_string(),
+            message: "当前未进入可同步的游戏世界".to_string(),
+            retryable: true,
+        }
+    );
+
+    let pong = r#"{"protocol":"palws","version":1,"type":"pong","id":"srv-3",
+        "payload":{"echo_id":"ping-1"}}"#;
+    assert_eq!(
+        sync::parse_server_message(pong).unwrap(),
+        ServerEvent::Pong {
+            echo_id: "ping-1".to_string(),
+        }
+    );
 }
 
 #[test]
-fn parse_null_fields() {
-    // mod 真实输出：passives / nickname 可能是 null
-    let text = r#"{"version":1,"source":"palws","pals":[
-        {"species":"Sheepball","gender":"unknown","passives":null,"nickname":null,"level":2},
-        {"species":null,"gender":"male","passives":["Brave"],"nickname":null,"level":null},
-        {"species":"Foxparks","gender":null,"passives":["Brave"]}
-    ]}"#;
-    let pals = sync::parse_message(text).unwrap();
-    assert_eq!(pals.len(), 3);
-    // passives null → 空数组
-    assert_eq!(pals[0].passives, Vec::<String>::new());
-    assert_eq!(pals[0].nickname, None);
-    // species / gender null → None / 空串（后续按"跳过该只"处理）
-    assert_eq!(pals[1].species, None);
-    assert_eq!(pals[2].gender, "");
+fn parse_unknown_type() {
+    let text = r#"{"protocol":"palws","version":1,"type":"future-thing","payload":{}}"#;
+    assert_eq!(
+        sync::parse_server_message(text).unwrap(),
+        ServerEvent::Unknown {
+            mtype: "future-thing".to_string()
+        }
+    );
 }
 
 #[test]
-fn parse_skips_bad_entries() {
-    // 单只字段类型完全对不上（如 level 是字符串）只丢该只，不影响其他
-    let text = r#"{"version":1,"source":"palws","pals":[
-        {"species":"PinkCat","gender":"male","passives":[],"level":"oops"},
-        {"species":"SheepBall","gender":"female","passives":[]},
-        "garbage"
-    ]}"#;
-    let pals = sync::parse_message(text).unwrap();
-    assert_eq!(pals.len(), 1);
-    assert_eq!(pals[0].species, Some("SheepBall".to_string()));
+fn parse_version_mismatch() {
+    let text = r#"{"protocol":"palws","version":2,"type":"snapshot","payload":{"pals":[]}}"#;
+    assert_eq!(
+        sync::parse_server_message(text),
+        Err(SyncError::UnsupportedVersion(2))
+    );
 }
+
+#[test]
+fn parse_protocol_mismatch() {
+    let text = r#"{"protocol":"other","version":1,"type":"snapshot","payload":{"pals":[]}}"#;
+    assert_eq!(
+        sync::parse_server_message(text),
+        Err(SyncError::UnsupportedProtocol("other".to_string()))
+    );
+}
+
+#[test]
+fn parse_invalid_json() {
+    assert!(matches!(
+        sync::parse_server_message("not json"),
+        Err(SyncError::Parse(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// 客户端请求构造
+// ---------------------------------------------------------------------------
+
+#[test]
+fn client_request_builders() {
+    assert!(sync::client_hello_json("0.1.0").contains("\"type\":\"client.hello\""));
+    assert!(sync::snapshot_request_json("req-1").contains("\"type\":\"snapshot.request\""));
+    assert!(sync::ping_json("ping-1").contains("\"type\":\"ping\""));
+}
+
+// ---------------------------------------------------------------------------
+// SyncedPal 转草稿 / 字段映射
+// ---------------------------------------------------------------------------
 
 #[test]
 fn draft_skips_missing_species_and_unknown_gender() {
@@ -108,49 +215,16 @@ fn draft_skips_missing_species_and_unknown_gender() {
             synced: true,
         })
     );
-    // species 为 null → 跳过
     let no_species = SyncedPal {
         species: None,
         ..ok.clone()
     };
     assert_eq!(no_species.to_owned_draft(), None);
-    // gender unknown → 跳过
     let unknown_gender = SyncedPal {
         gender: "unknown".to_string(),
         ..ok.clone()
     };
     assert_eq!(unknown_gender.to_owned_draft(), None);
-}
-
-#[test]
-fn garbage_passives_pass_through_parse() {
-    // mod 侧在修的垃圾字符串（如 "RemoteUnrealParam: ..."）解析层原样保留；
-    // 剔除由 sync_client 合并时按内置被动表完成（passive_by_internal）。
-    let text = r#"{"version":1,"pals":[
-        {"species":"Sheepball","gender":"male","passives":["RemoteUnrealParam: 00000233CA3CFB08"]}
-    ]}"#;
-    let pals = sync::parse_message(text).unwrap();
-    assert_eq!(
-        pals[0].passives,
-        vec!["RemoteUnrealParam: 00000233CA3CFB08".to_string()]
-    );
-}
-
-#[test]
-fn parse_version_mismatch() {
-    let text = r#"{"version":2,"source":"palws","pals":[]}"#;
-    assert_eq!(
-        sync::parse_message(text),
-        Err(SyncError::UnsupportedVersion(2))
-    );
-}
-
-#[test]
-fn parse_invalid_json() {
-    assert!(matches!(
-        sync::parse_message("not json"),
-        Err(SyncError::Parse(_))
-    ));
 }
 
 #[test]
@@ -162,57 +236,7 @@ fn parse_gender_mapping() {
 }
 
 #[test]
-fn merge_dedupes_against_existing() {
-    let mut existing = vec![owned(1, "PinkCat", Gender::Male, &["Brave"])];
-    let incoming = vec![
-        // 与现有完全相同（被动顺序不同也算同一只）→ 跳过
-        owned(0, "PinkCat", Gender::Male, &["Brave"]),
-        // 性别不同 → 新增
-        owned(0, "PinkCat", Gender::Female, &["Brave"]),
-        // 被动不同 → 新增
-        owned(0, "PinkCat", Gender::Male, &["Brave", "Lucky"]),
-    ];
-    let added = sync::merge_owned(&mut existing, incoming);
-    assert_eq!(added, 2);
-    assert_eq!(existing.len(), 3);
-    // id 按 max+1 递增
-    assert_eq!(existing[1].id, 2);
-    assert_eq!(existing[2].id, 3);
-}
-
-#[test]
-fn merge_passive_order_insensitive() {
-    let mut existing = vec![owned(7, "Anubis", Gender::Male, &["A", "B"])];
-    let incoming = vec![owned(0, "Anubis", Gender::Male, &["B", "A"])];
-    assert_eq!(sync::merge_owned(&mut existing, incoming), 0);
-    assert_eq!(existing.len(), 1);
-}
-
-#[test]
-fn merge_dedupes_within_incoming() {
-    let mut existing = Vec::new();
-    let incoming = vec![
-        owned(0, "Foxparks", Gender::Male, &[]),
-        owned(0, "Foxparks", Gender::Male, &[]),
-    ];
-    assert_eq!(sync::merge_owned(&mut existing, incoming), 1);
-    assert_eq!(existing[0].id, 1);
-}
-
-#[test]
-fn strip_boss_prefix_variants() {
-    assert_eq!(sync::strip_boss_prefix("BOSS_SheepBall"), "SheepBall");
-    assert_eq!(sync::strip_boss_prefix("Boss_Anubis"), "Anubis");
-    assert_eq!(sync::strip_boss_prefix("boss_Foxparks"), "Foxparks");
-    // 无前缀 / 空前缀体 / 仅前缀的情况原样返回
-    assert_eq!(sync::strip_boss_prefix("SheepBall"), "SheepBall");
-    assert_eq!(sync::strip_boss_prefix("BOSS_"), "BOSS_");
-    assert_eq!(sync::strip_boss_prefix("BOSSY_Cat"), "BOSSY_Cat");
-}
-
-#[test]
 fn parse_group_mapping() {
-    use planner::PalGroup;
     assert_eq!(sync::parse_group(Some("party")), PalGroup::Party);
     assert_eq!(sync::parse_group(Some("box")), PalGroup::Box);
     assert_eq!(sync::parse_group(Some("base")), PalGroup::Base);
@@ -221,33 +245,51 @@ fn parse_group_mapping() {
 }
 
 #[test]
-fn merge_refreshes_group_on_resync() {
-    use planner::PalGroup;
-    let mut existing = vec![owned(1, "Foxparks", Gender::Male, &[])];
-    // 同一只帕鲁再次同步（位置从盒子变为队伍）：不新增，只刷新 group
-    let mut moved = owned(0, "Foxparks", Gender::Male, &[]);
-    moved.group = PalGroup::Party;
-    assert_eq!(sync::merge_owned(&mut existing, vec![moved]), 0);
-    assert_eq!(existing.len(), 1);
-    assert_eq!(existing[0].group, PalGroup::Party);
+fn strip_boss_prefix_variants() {
+    assert_eq!(sync::strip_boss_prefix("BOSS_SheepBall"), "SheepBall");
+    assert_eq!(sync::strip_boss_prefix("Boss_Anubis"), "Anubis");
+    assert_eq!(sync::strip_boss_prefix("boss_Foxparks"), "Foxparks");
+    assert_eq!(sync::strip_boss_prefix("SheepBall"), "SheepBall");
+    assert_eq!(sync::strip_boss_prefix("BOSS_"), "BOSS_");
+    assert_eq!(sync::strip_boss_prefix("BOSSY_Cat"), "BOSSY_Cat");
 }
 
+// ---------------------------------------------------------------------------
+// 合并语义
+// ---------------------------------------------------------------------------
+
 #[test]
-fn overwrite_replaces_entire_list() {
-    // 全量替换：手动添加的（synced=false）也会被清掉，列表 = 本次同步内容
-    let mut existing = vec![
-        owned(1, "Foxparks", Gender::Male, &[]), // 手动
-        owned(2, "Lamball", Gender::Female, &[]),
-    ];
-    existing[0].synced = false;
-    existing[1].synced = true;
+fn replace_synced_keeps_manual_entries() {
+    // v1 推荐语义：同步条目全部替换，手工条目保留
+    let mut manual = owned(1, "Foxparks", Gender::Male, &[]);
+    manual.synced = false;
+    let mut synced_old = owned(2, "Lamball", Gender::Female, &[]);
+    synced_old.synced = true;
+    let mut existing = vec![manual, synced_old];
+
     let incoming = vec![
         owned(0, "Chikipi", Gender::Male, &[]),
         owned(0, "Pengullet", Gender::Female, &[]),
     ];
-    let n = sync::overwrite_owned(&mut existing, incoming);
+    let n = sync::replace_synced(&mut existing, incoming);
     assert_eq!(n, 2);
-    assert_eq!(existing.len(), 2, "手动添加的也应被替换");
-    assert!(existing.iter().all(|p| p.synced));
-    assert!(existing.iter().all(|p| p.id >= 1));
+    assert_eq!(existing.len(), 3, "手工条目保留 + 2 条新同步");
+    // 手工条目仍在
+    assert!(existing.iter().any(|p| p.species == "Foxparks" && !p.synced));
+    // 旧的同步条目被替换
+    assert!(!existing.iter().any(|p| p.species == "Lamball"));
+    // 新同步条目 id 从手工最大 id 之后递增，且标记 synced
+    let synced: Vec<&OwnedPal> = existing.iter().filter(|p| p.synced).collect();
+    assert_eq!(synced.len(), 2);
+    assert!(synced.iter().all(|p| p.id >= 2));
+}
+
+#[test]
+fn replace_synced_empty_incoming_keeps_manual() {
+    let mut manual = owned(5, "Foxparks", Gender::Male, &[]);
+    manual.synced = false;
+    let mut existing = vec![manual];
+    assert_eq!(sync::replace_synced(&mut existing, Vec::new()), 0);
+    assert_eq!(existing.len(), 1);
+    assert_eq!(existing[0].species, "Foxparks");
 }

@@ -1,37 +1,34 @@
--- Palws: sync pal terminal (PalBox) contents to external app over WebSocket.
--- v4: container-direct enumeration + slot-form probing + callback hardening.
+-- Palws: sync PalBox contents to the companion web app over WebSocket.
 --
--- Crash hardening: EVERY callback (NotifyOnNewObject / keybind / timer) is
--- wrapped in xpcall(debug.traceback); errors are logged, never propagate
--- into UE4SS's C++ dispatch (0xe06d7363). The base-class wide capture is
--- registered LAZILY on first F6 (it fires per-widget and is the prime
--- suspect for the post-dump crash during terminal navigation).
+-- Production v1 contract:
+--   * no automatic sync (no UI/Widget/map-load/object-creation triggers)
+--   * single explicit entry point `requestSnapshot` shared by F7 and web refresh
+--   * every state-machine step re-fetches PlayerState; no UObject held across timers
+--   * Lua -> Rust goes through `palws.broadcast(json)` only (no file transport)
 --
--- Slot access (kit PalIndividualCharacterSlot.h): slot:IsEmpty(),
--- slot:GetHandle(), slot.ReplicateIndividualParameter; container:Get(i) is
--- 0-based; GetSlots() Lua array is 1-based.
+-- Crash hardening: every callback is wrapped in xpcall(debug.traceback); errors are
+-- logged, never propagated into UE4SS's C++ dispatch.
 
--- field switches for crash bisecting: off = never invoked, outputs default
-local READ_PASSIVES = true   -- RE-VERIFY on UE4SS Experimental: FName array marshaling
-local READ_GENDER   = true   -- RE-VERIFY on UE4SS Experimental (Palworld): UEnum::Names 0x48 layout
-local READ_NICKNAME = true   -- struct FString member, suspected safe
+local READ_PASSIVES = true
+local READ_GENDER   = true
+local READ_NICKNAME = true
 local MAX_DUMP_PALS = 960
 local PALBOX_PAGE_COUNT = 32
 local PALBOX_PAGE_REQUEST_DELAY_MS = 200
 local PALBOX_REPLICATION_SETTLE_MS = 3000
+local SYNC_COOLDOWN_SEC = 15
+local COMMAND_PUMP_INTERVAL_MS = 250
 
 print("[Palws] mod loading\n")
 
 -- ---------- callback guard ----------
 local function guarded(name, fn)
     return function(...)
-        print("[Palws] cb enter: " .. name .. "\n")
         local tb = (type(debug) == "table" and debug.traceback) and debug.traceback or function(e) return tostring(e) end
         local ok, err = xpcall(fn, tb, ...)
         if not ok then
-            print("[Palws] CALLBACK-ERROR in " .. name .. ": " .. tostring(err) .. "\n")
+            print("[Palws] ERROR in " .. name .. ": " .. tostring(err) .. "\n")
         end
-        print("[Palws] cb exit: " .. name .. "\n")
     end
 end
 
@@ -41,16 +38,6 @@ do
     local ok, res = pcall(require, "palws")
     print("[Palws] require 'palws': ok=" .. tostring(ok) .. " res=" .. tostring(res) .. "\n")
     if ok and type(res) == "table" then palws = res end
-    if not palws then
-        local dll = [[G:\SteamLibrary\steamapps\common\Palworld\Pal\Binaries\Win64\Mods\Palws\scripts\palws.dll]]
-        local f, err = package.loadlib(dll, "luaopen_palws")
-        print("[Palws] loadlib: f=" .. tostring(f) .. " err=" .. tostring(err) .. "\n")
-        if f then
-            local ok2, res2 = pcall(f)
-            print("[Palws] loadlib call: ok=" .. tostring(ok2) .. " res=" .. tostring(res2) .. "\n")
-            if ok2 and type(res2) == "table" then palws = res2 end
-        end
-    end
 end
 if not palws then
     print("[Palws] FATAL: palws native module unavailable, mod disabled\n")
@@ -68,9 +55,6 @@ local function isValid(obj)
 end
 
 local function className(obj)
-    -- isValid first: GetClass on a null object wrapper derefs null+offset
-    -- natively (AV, uncatchable); struct wrappers have no IsValid -> pcall
-    -- fails -> treated as not-an-object. Both safe.
     if not isValid(obj) then return nil end
     local ok, n = pcall(function() return obj:GetClass():GetFName():ToString() end)
     if ok then return n end
@@ -88,26 +72,75 @@ local function jsonStr(v)
     return '"' .. jsonEscape(v) .. '"'
 end
 
-local PAYLOAD_PATH = [[C:\Users\xiaob\palworld-dump\palws-payload.json]]
-local PAYLOAD_TMP  = PAYLOAD_PATH .. ".tmp"
+-- extract a string field from a small JSON object (used for Rust command envelopes)
+local function jsonField(json, key)
+    return json:match('"' .. key .. '"%s*:%s*"([^"]*)"')
+end
 
-local function broadcastJson(json)
-    local f = io.open(PAYLOAD_TMP, "w")
-    if not f then
-        print("[Palws] broadcast: cannot open tmp payload file\n")
-        return
+-- ---------- protocol event helpers ----------
+-- Rust stamps the server-side `seq` and `timestamp_ms`; Lua provides the
+-- envelope header (protocol/version/type/id/request_id) and the payload.
+local eventSeq = 0
+
+local function emitEvent(eventType, requestId, payloadJson)
+    if not palws or type(palws.broadcast) ~= "function" then return nil end
+    eventSeq = eventSeq + 1
+    local parts = {}
+    parts[#parts + 1] = '"protocol":"palws"'
+    parts[#parts + 1] = '"version":1'
+    parts[#parts + 1] = '"type":' .. jsonStr(eventType)
+    parts[#parts + 1] = '"id":' .. jsonStr("lua-" .. eventSeq)
+    if requestId ~= nil then
+        parts[#parts + 1] = '"request_id":' .. jsonStr(requestId)
     end
-    f:write(json)
-    f:close()
-    os.remove(PAYLOAD_PATH)
-    local okRen, renErr = os.rename(PAYLOAD_TMP, PAYLOAD_PATH)
-    if not okRen then
-        print("[Palws] broadcast: rename failed: " .. tostring(renErr) .. "\n")
-        return
+    parts[#parts + 1] = '"payload":' .. (payloadJson or "{}")
+    local json = "{" .. table.concat(parts, ",") .. "}"
+    local ok, res = pcall(palws.broadcast, json)
+    if not ok then
+        print("[Palws] broadcast error: " .. tostring(res) .. "\n")
     end
-    local okN, res = pcall(palws.notify)
-    print("[Palws] notify: ok=" .. tostring(okN) .. " res=" .. tostring(res)
-        .. " bytes=" .. #json .. "\n")
+    return json
+end
+
+local function emitStatus(phase, requestId, requestedPages, totalPages, trigger)
+    local payload = '{'
+        .. '"phase":' .. jsonStr(phase)
+        .. ',"requested_pages":' .. tostring(requestedPages or 0)
+        .. ',"total_pages":' .. tostring(totalPages or 0)
+        .. ',"trigger":' .. jsonStr(trigger or "")
+        .. '}'
+    return emitEvent("sync.status", requestId, payload)
+end
+
+local function emitLog(level, message, requestId)
+    local payload = '{'
+        .. '"level":' .. jsonStr(level)
+        .. ',"source":"lua"'
+        .. ',"message":' .. jsonStr(message)
+        .. '}'
+    return emitEvent("log", requestId, payload)
+end
+
+local function emitError(code, message, requestId, retryable)
+    local payload = '{'
+        .. '"code":' .. jsonStr(code)
+        .. ',"message":' .. jsonStr(message)
+        .. ',"retryable":' .. tostring(retryable == true)
+        .. '}'
+    return emitEvent("error", requestId, payload)
+end
+
+local function emitSnapshot(requestId, palsJson, total, requestedPages, requestErrors, containers)
+    local payload = '{'
+        .. '"mode":"replace"'
+        .. ',"pals":[' .. table.concat(palsJson, ",") .. ']'
+        .. ',"stats":{"total":' .. tostring(total)
+        .. ',"requested_pages":' .. tostring(requestedPages)
+        .. ',"request_errors":' .. tostring(requestErrors)
+        .. ',"containers":' .. tostring(containers)
+        .. '}'
+        .. '}'
+    return emitEvent("snapshot", requestId, payload)
 end
 
 local function tryCall(obj, fname)
@@ -123,10 +156,7 @@ local function tryProp(obj, pname)
 end
 
 -- ---------- reflection whitelist (never touch nonexistent members) ----------
--- Reading a nonexistent member on a UE4SS object returns a shell wrapper;
--- touching the shell's members AVs. So: enumerate first, read only known names.
-local classCache = {} -- className -> { props={name->true}, funcs={name->true} }
-
+local classCache = {}
 local function buildClassCache(obj)
     local cn = className(obj)
     if cn == nil then return nil end
@@ -168,8 +198,8 @@ local function buildClassCache(obj)
     return entry
 end
 
--- struct wrapper (e.g. SaveParameter) field whitelist via its UScriptStruct
-local structCache = {} -- struct path -> {name->true}
+local structCache = {}
+local SAVEPARAM_STRUCT = "/Script/Pal.PalIndividualCharacterSaveParameter"
 local function buildStructCache(structPath)
     if structCache[structPath] then return structCache[structPath] end
     local entry = { set = {}, types = {} }
@@ -191,12 +221,6 @@ local function buildStructCache(structPath)
     return entry
 end
 
-local SAVEPARAM_STRUCT = "/Script/Pal.PalIndividualCharacterSaveParameter"
-
--- validated member access: member enumeration in this UE4SS build is
--- incomplete, so whitelists only inform logs; calls go through pcall and
--- results are validated by expected shape. Shell wrappers (from nonexistent
--- members) are rejected via isValid / tostring-prefix checks.
 local function isShell(v)
     if type(v) ~= "userdata" then return false end
     if isValid(v) then return false end
@@ -221,10 +245,9 @@ local function validShape(v, expect)
         end
         return false
     end
-    return true -- "any"
+    return true
 end
 
--- functions are pcall-safe in this build: always attempt
 local function safeCall(obj, name)
     return tryCall(obj, name)
 end
@@ -233,11 +256,6 @@ local function safeProp(obj, name, expect)
     local v = tryProp(obj, name)
     if not validShape(v, expect or "any") then return nil end
     return v
-end
-
-local function structPropType(name)
-    local cache = buildStructCache(SAVEPARAM_STRUCT)
-    return cache.types and cache.types[name] or nil
 end
 
 local function safeStructProp(structWrapper, name, expect)
@@ -256,13 +274,7 @@ local function fnameToString(v)
     return nil
 end
 
--- unwrap RemoteUnrealParam / similar wrappers (UE4SS returns these for some
--- UFunction return values and array elements)
 local function unwrap(v)
-    -- only genuine wrappers: userdata that exposes a callable .get
-    -- (a RemoteUnrealParam wrapping a PRIMITIVE may AV inside :get();
-    -- callers must only unwrap values known to wrap names/objects)
-    -- iterate: wrappers can nest (RemoteUnrealParam > RemoteUnrealParam > FName)
     local cur = v
     for _ = 1, 4 do
         if type(cur) ~= "userdata" then return cur end
@@ -275,12 +287,12 @@ local function unwrap(v)
     return cur
 end
 
--- ---------- field readers ----------
 local function looksLikeObjectDump(s)
     return s ~= nil and (s:find("^UObject:") or s:find("^UFunction:") or s:find("^Property")
         or s:find("^RemoteUnrealParam:"))
 end
 
+-- ---------- field readers ----------
 local function mapGenderNumber(n)
     n = math.floor(n)
     if n == 1 then return "male" end
@@ -290,13 +302,12 @@ end
 
 local function mapGenderString(s)
     if s == nil then return "unknown" end
-    if s:find("Female") then return "female" end -- check Female first!
+    if s:find("Female") then return "female" end
     if s:find("Male") then return "male" end
     return "unknown"
 end
 
 local function readSpecies(param)
-    -- method first (kit: FName GetCharacterID() const)
     local v = safeCall(param, "GetCharacterID")
     if v == nil then v = safeProp(param, "CharacterID", "fname") end
     local s = fnameToString(v)
@@ -306,8 +317,6 @@ end
 
 local function readNickname(param)
     if not READ_NICKNAME then return nil end
-    -- struct member read: FString props may come back wrapped (RemoteUnrealParam)
-    -- on the experimental build; unwrap + tostring, then filter garbage.
     local function s2str(v)
         if v == nil then return nil end
         if type(v) == "string" then return v end
@@ -338,8 +347,6 @@ end
 
 local function readGender(param)
     if not READ_GENDER then return "unknown" end
-    -- function-call only: enum PROPERTY/MEMBER reads AV in this UE4SS build.
-    -- UFUNCTION enum returns arrive as plain numbers or FName-ish; no :get().
     local v = safeCall(param, "GetGenderType") or safeCall(param, "GetGender")
     if type(v) == "number" then return mapGenderNumber(v) end
     if type(v) == "string" then return mapGenderString(v) end
@@ -350,8 +357,6 @@ local function readGender(param)
     return "unknown"
 end
 
--- favorite index: 0=none, 1/2/3 = I/II/III (FavoriteIndex is the live field;
--- IsFavoritePal is stale/always-false in v0.7, verified by favscan)
 local function readFavorite(param)
     local sp = safeProp(param, "SaveParameter", "struct")
     if sp == nil then return 0 end
@@ -360,7 +365,6 @@ local function readFavorite(param)
     return 0
 end
 
--- lucky (稀有/闪光) flag: IsRarePal — live field, verified by favscan
 local function readLucky(param)
     local sp = safeProp(param, "SaveParameter", "struct")
     if sp == nil then return false end
@@ -379,8 +383,6 @@ end
 
 local function readPassives(param)
     if not READ_PASSIVES then return nil end
-    -- function entry first (kit: UFUNCTION TArray<FName> GetPassiveSkillList);
-    -- struct array member as fallback (array != enum, may be safe)
     local list = safeCall(param, "GetPassiveSkillList")
     if list == nil then
         local sp = safeProp(param, "SaveParameter", "struct")
@@ -391,15 +393,12 @@ local function readPassives(param)
         end
     end
     if list == nil then return nil end
-    if list == nil then return nil end
     local okN, n = pcall(function() return #list end)
     if not okN or type(n) ~= "number" or n <= 0 then return nil end
     local out = {}
     for i = 1, math.min(n, 16) do
         local okE, e = pcall(function() return list[i] end)
         if okE and e ~= nil then
-            -- element is FName per kit (TArray<FName>): try direct ToString
-            -- first; only if it is a wrapper do a guarded unwrap
             local s = fnameToString(e)
             if (s == nil or looksLikeObjectDump(s)) and type(e) == "userdata" then
                 s = fnameToString(unwrap(e))
@@ -412,10 +411,7 @@ local function readPassives(param)
     return out
 end
 
--- ---------- pal json ----------
 local function readField(name, verbose, fn)
-    -- the invoking line prints BEFORE the native call: on a crash the last
-    -- invoking line names the killer field
     if verbose then print("[Palws]   field " .. name .. " invoking" .. "\n") end
     local tb = (type(debug) == "table" and debug.traceback) and debug.traceback
         or function(e) return tostring(e) end
@@ -428,36 +424,17 @@ local function readField(name, verbose, fn)
     return nil
 end
 
-local function readMemFields(param)
-    -- rust read_saveparam was removed (reflection authoritative since the
-    -- UE4SS Experimental Palworld build fixed enum/FName marshaling);
-    -- guard so a stale dll still degrades gracefully instead of erroring.
-    if type(palws.read_saveparam) ~= "function" then return nil end
-    local okA, addr = pcall(function() return param:GetAddress() end)
-    if not okA or type(addr) ~= "number" or addr == 0 then
-        return nil
-    end
-    local okR, frag = pcall(palws.read_saveparam, addr)
-    if okR and type(frag) == "string" and frag ~= "" then return frag end
-    return nil
-end
-
 local function buildPalJson(param, idx, verbose)
     if not isValid(param) then return nil end
     if verbose then print("[Palws] step: slot " .. idx .. " read fields\n") end
     local species  = readField("species", verbose, function() return readSpecies(param) end)
-    if species == nil or species == "" then return nil end -- app: species required
+    if species == nil or species == "" then return nil end
     local gender   = readField("gender", verbose, function() return readGender(param) end)
     local nickname = readField("nickname", verbose, function() return readNickname(param) end)
     local level    = readField("level", verbose, function() return readLevel(param) end)
     local passives = readField("passives", verbose, function() return readPassives(param) end)
     local favorite = readField("favorite", verbose, function() return readFavorite(param) end)
-    local lucky = readField("lucky", verbose, function() return readLucky(param) end)
-    local memfrag  = readField("memfields", verbose, function() return readMemFields(param) end)
-    -- NOTE: reflection reads are authoritative now (UE4SS Experimental
-    -- Palworld build: UEnum::Names 0x48 layout fixed enum + FName marshaling).
-    -- memfrag (rust raw-memory path) no longer feeds the payload; the call is
-    -- kept so F5 deep-diag can still cross-check the two paths.
+    local lucky    = readField("lucky", verbose, function() return readLucky(param) end)
 
     local parts = {}
     parts[#parts + 1] = '"species":' .. jsonStr(species)
@@ -466,7 +443,7 @@ local function buildPalJson(param, idx, verbose)
     if passives then
         for _, p in ipairs(passives) do ps[#ps + 1] = jsonStr(p) end
     end
-    parts[#parts + 1] = '"passives":[' .. table.concat(ps, ",") .. "]" -- always array
+    parts[#parts + 1] = '"passives":[' .. table.concat(ps, ",") .. "]"
     parts[#parts + 1] = '"nickname":' .. jsonStr(nickname)
     parts[#parts + 1] = '"level":' .. (level and tostring(level) or "null")
     parts[#parts + 1] = '"favorite":' .. tostring(favorite or 0)
@@ -474,84 +451,28 @@ local function buildPalJson(param, idx, verbose)
     return "{" .. table.concat(parts, ",") .. "}"
 end
 
--- slot -> parameter (several routes, kit-named)
 local function slotParam(slot)
     if not isValid(slot) then return nil end
     local empty = tryCall(slot, "IsEmpty")
     if empty == true then return nil end
-    -- route 1: GetHandle() -> TryGetIndividualParameter()
     local okH, handle = pcall(function() return slot:GetHandle() end)
     if okH and isValid(handle) then
         local okP, param = pcall(function() return handle:TryGetIndividualParameter() end)
         if okP and isValid(param) then return param end
     end
-    -- route 2: GetLastHandleForClient()
     local okH2, h2 = pcall(function() return slot:GetLastHandleForClient() end)
     if okH2 and isValid(h2) then
         local okP2, p2 = pcall(function() return h2:TryGetIndividualParameter() end)
         if okP2 and isValid(p2) then return p2 end
     end
-    -- route 3: replicated parameter directly on the slot
     local p3 = tryProp(slot, "ReplicateIndividualParameter")
     if isValid(p3) then return p3 end
-    -- route 4: raw Handle property
     local h4 = tryProp(slot, "Handle")
     if isValid(h4) then
         local okP4, p4 = pcall(function() return h4:TryGetIndividualParameter() end)
         if okP4 and isValid(p4) then return p4 end
     end
     return nil
-end
-
--- ---------- slot form probe (runs once when a container yields 0 pals) ----------
-local probeDone = false
-local function probeSlot(container)
-    print("[Palws] step: probe slot form\n")
-    local slot = nil
-    local ok0, s0 = pcall(function() return container:Get(0) end)
-    print("[Palws]   Get(0): ok=" .. tostring(ok0) .. " luatype=" .. type(s0) .. "\n")
-    if ok0 and s0 ~= nil then slot = s0 end
-    if slot == nil then
-        local slots = tryCall(container, "GetSlots")
-        if slots ~= nil then
-            local ok1, s1 = pcall(function() return slots[1] end)
-            print("[Palws]   GetSlots()[1]: ok=" .. tostring(ok1) .. " luatype=" .. type(s1) .. "\n")
-            if ok1 and s1 ~= nil then slot = s1 end
-        end
-    end
-    if slot == nil then
-        print("[Palws]   no slot object obtained at all\n")
-        return
-    end
-    local okT, tt = pcall(function() return slot:type() end)
-    print("[Palws]   slot:type() ok=" .. tostring(okT) .. " -> " .. tostring(tt) .. "\n")
-    print("[Palws]   className: " .. tostring(className(slot)) .. "\n")
-    print("[Palws]   isValid: " .. tostring(isValid(slot)) .. "\n")
-    for _, m in ipairs({ "IsEmpty", "GetSlotIndex", "GetHandle", "GetLastHandleForClient" }) do
-        local okM, r = pcall(function() return slot[m](slot) end)
-        local rinfo = tostring(r)
-        if okM and type(r) == "userdata" then rinfo = "userdata valid=" .. tostring(isValid(r)) end
-        print("[Palws]   " .. m .. "(): ok=" .. tostring(okM) .. " -> " .. rinfo .. "\n")
-    end
-    for _, pn in ipairs({ "Handle", "ReplicateIndividualParameter", "SlotIndex", "ContainerId" }) do
-        local okP, v = pcall(function() return slot[pn] end)
-        local info
-        if not okP then info = "ERR"
-        elseif v == nil then info = "nil"
-        elseif type(v) == "userdata" then
-            local vv = isValid(v)
-            info = "userdata valid=" .. tostring(vv)
-            if vv then info = info .. " class=" .. tostring(className(v)) end
-        else info = type(v) .. "=" .. tostring(v) end
-        print("[Palws]   prop " .. pn .. ": " .. info .. "\n")
-    end
-    local param = slotParam(slot)
-    print("[Palws]   slotParam -> " .. tostring(isValid(param)) .. "\n")
-    if isValid(param) then
-        print("[Palws]   species=" .. tostring(readSpecies(param))
-            .. " nick=" .. tostring(readNickname(param))
-            .. " level=" .. tostring(readLevel(param)) .. "\n")
-    end
 end
 
 -- ---------- containers ----------
@@ -561,31 +482,7 @@ local function getContainers()
     return {}
 end
 
-local function containerSummary(container)
-    local num = tryCall(container, "Num")
-    local slots = tryCall(container, "GetSlots")
-    local nslots = nil
-    if slots ~= nil then
-        local ok, n = pcall(function() return #slots end)
-        if ok then nslots = n end
-    end
-    local firstPal = nil
-    if nslots and nslots > 0 then
-        for i = 0, math.min(nslots - 1, 29) do
-            local okS, slot = pcall(function() return container:Get(i) end)
-            if okS and isValid(slot) then
-                local param = slotParam(slot)
-                if isValid(param) then
-                    firstPal = readSpecies(param) or readNickname(param) or "?"
-                    break
-                end
-            end
-        end
-    end
-    return num, nslots, firstPal
-end
-
-local baseCampSeq = 0  -- per-dump base container ordinal (reset in dumpAll)
+local baseCampSeq = 0
 
 local function dumpContainerPals(container, cidx)
     local num = tryCall(container, "Num")
@@ -596,11 +493,7 @@ local function dumpContainerPals(container, cidx)
         if okN then n = cnt end
     end
     if n == nil and type(num) == "number" then n = math.floor(num) end
-    if n == nil then
-        print("[Palws] container " .. cidx .. ": size unknown\n")
-        return {}
-    end
-    -- group by container size: 5=party, 960=palbox, else=base facility
+    if n == nil then return {} end
     local group = "base"
     if n == 5 then group = "party" elseif n == 960 then group = "box" end
     local pals = {}
@@ -608,613 +501,47 @@ local function dumpContainerPals(container, cidx)
         local okSlot, slot = pcall(function() return container:Get(i) end)
         if okSlot and isValid(slot) then
             local param = slotParam(slot)
-            -- verbose for the first 3 non-empty slots (field-level detail)
-            local verbose = isValid(param) and #pals < 3
-            local pj = buildPalJson(param, i, verbose)
+            local pj = buildPalJson(param, i, false)
             if pj then
-                -- tag each pal with its container index + group (party/box/base)
                 pj = pj:sub(1, 1) .. '"container":' .. cidx .. ',"group":"' .. group .. '",' .. pj:sub(2)
                 if group == "base" then
-                    -- base camps are one container each; tag an ordinal so the
-                    -- app can group them into per-camp tabs
                     baseCampSeq = baseCampSeq + 1
                     pj = pj:sub(1, 1) .. '"basecamp":' .. baseCampSeq .. ',' .. pj:sub(2)
                 end
                 pals[#pals + 1] = pj
-                if verbose then print("[Palws]   pal[" .. i .. "]: " .. pj .. "\n") end
             end
         end
     end
-    if #pals == 0 and not probeDone then
-        probeDone = true
-        pcall(probeSlot, container)
-    end
-    print("[Palws] container " .. cidx .. ": dumped " .. #pals .. "/" .. n .. " pals\n")
     return pals
 end
 
--- Assigned after the PlayerState RPC helpers are declared. Pump/F7 callbacks
--- capture this forward declaration and run only after the script has loaded.
-local syncPalBoxAndDump
-
-local function dumpAll(reason)
+-- Collect every readable container into a single full snapshot (no broadcast here).
+-- Returns (palsJsonArray, statsTable).
+local function collectAllPals()
     baseCampSeq = 0
-    print("[Palws] dumpAll enter (" .. reason .. ")\n")
     local containers = getContainers()
-    print("[Palws] containers found: " .. #containers .. "\n")
-    if #containers == 0 then
-        print("[Palws] dumpAll exit: no containers\n")
-        return
-    end
-
-    for i, c in ipairs(containers) do
-        local num, nslots, firstPal = containerSummary(c)
-        print(string.format("[Palws]   container %d: num=%s slots=%s first=%s\n",
-            i, tostring(num), tostring(nslots), tostring(firstPal)))
-    end
-
-    -- aggregate every container into ONE message so the app's pending
-    -- list is never overwritten by rapid successive broadcasts
-    local seen = {}   -- container address -> true (dedup across page turns)
+    local seen = {}
     local all = {}
     local cidx = -1
-    local function collect(container)
-        local addr = container:GetAddress()
-        if seen[addr] then return false end
-        seen[addr] = true
-        cidx = cidx + 1
-        local okC, res = pcall(dumpContainerPals, container, cidx)
-        if okC and type(res) == "table" then
-            for _, pj in ipairs(res) do all[#all + 1] = pj end
-            return true
-        elseif not okC then
-            print("[Palws] container " .. cidx .. " dump ERROR: " .. tostring(res) .. "\n")
-        end
-        return false
-    end
-    for _, c in ipairs(containers) do collect(c) end
-    broadcastJson('{"version":1,"source":"palws","event":"' .. reason
-        .. '","pals":[' .. table.concat(all, ",") .. "]}")
-    print("[Palws] dumpAll exit ok, total " .. #all .. " pals\n")
-end
-
--- ---------- deep diagnostics (F5) ----------
-local function walkObjectProps(obj, label)
-    print("[Palws] step: property walk of " .. label .. "\n")
-    local okCls, cls = pcall(function() return obj:GetClass() end)
-    if not okCls or cls == nil then
-        print("[Palws]   GetClass failed\n")
-        return
-    end
-    local hops = 0
-    while cls and hops < 32 do
-        hops = hops + 1
-        pcall(function()
-            cls:ForEachProperty(function(prop)
-                local okFull, full = pcall(function() return prop:GetFullName() end)
-                if not okFull or full == nil then return false end
-                if full:find("^ObjectProperty") or full:find("^ClassProperty") or full:find("^SoftObjectProperty") then
-                    local pname = full:match("[:%s]([%w_]+)$") or full
-                    local v = tryProp(obj, pname)
-                    if isValid(v) then
-                        print("[Palws]     prop " .. pname .. " -> " .. (className(v) or "?") .. "\n")
-                    end
-                end
-                return false
-            end)
-        end)
-        local okS, sup = pcall(function() return cls:GetSuperStruct() end)
-        if okS and sup then
-            local okV, valid = pcall(function() return sup:IsValid() end)
-            cls = (okV and valid) and sup or nil
-        else
-            cls = nil
-        end
-    end
-end
-
-local function census()
-    print("[Palws] step: class census\n")
-    for _, cn in ipairs({
-        "PalUIPalStorageModel", "PalUIPalBoxModel", "PalMapObjectPalStorageModel",
-        "PalCharacterContainerManager", "PalIndividualCharacterContainer",
-        "PalGlobalPalStorageSubsystem", "PalBaseCampManager",
-    }) do
-        local ok, t = pcall(function() return FindAllOf(cn) end)
-        local cnt = (ok and type(t) == "table") and #t or 0
-        print("[Palws]   census " .. cn .. ": " .. cnt .. "\n")
-    end
-end
-
--- ---------- triggers ----------
-local lastWidget = nil
-local dirty = false
-
-local CANDIDATES = {
-    "WBP_PalStorageMenu",
-    "WBP_IngameMenu_PalBox",
-    "WBP_GlobalPalStorage_ForDisplay",
-    "WBP_DimensionPalStorage_ForDisplay",
-}
--- NotifyOnNewObject requires the FULL class path (e.g. /Script/Engine.Actor)
--- and the class to EXIST at registration time. BP widget classes load lazily
--- (not present at main-menu), so static registration is pointless and noisy.
--- Instead we register dynamically once an instance is observed: resolve the
--- class path from the instance's UClass and hook it then. Registration
--- succeeds because the class now exists.
-local dynTried = {}    -- simple class name -> true (attempted)
-local dynHooked = {}   -- full path      -> true (registered)
-local function tryRegisterByInstance(inst)
-    local okC, clsObj = pcall(function() return inst:GetClass() end)
-    if not (okC and isValid(clsObj)) then return false end
-    local okF, full = pcall(function() return clsObj:GetFullName() end)
-    -- UClass GetFullName: "Class /Game/.../WBP_X.WBP_X_C" -> take path part
-    local path = okF and tostring(full):match("^%S+%s+(.+)$") or nil
-    if not path then return false end
-    if dynHooked[path] then return true end
-    local ok, err = pcall(function()
-        NotifyOnNewObject(path, guarded("notify-" .. path, function(obj)
-            if isValid(obj) then
-                lastWidget = obj
-                dirty = true
-                print("[Palws] widget created: " .. path .. "\n")
-            end
-        end))
-    end)
-    if ok then
-        dynHooked[path] = true
-        print("[Palws] NotifyOnNewObject registered: " .. path .. "\n")
-    else
-        print("[Palws] NotifyOnNewObject FAILED " .. path .. ": " .. tostring(err) .. "\n")
-    end
-    return ok
-end
--- lazy hook sweep: probe each candidate's class once its first instance shows
--- up in the world; cheap FindFirstOf per pump tick until class is loaded.
-local function sweepDynamicHooks()
-    for _, cls in ipairs(CANDIDATES) do
-        if not dynTried[cls] then
-            local ok, obj = pcall(function() return FindFirstOf(cls .. "_C") end)
-            if ok and isValid(obj) then
-                dynTried[cls] = true
-                tryRegisterByInstance(obj)
-            end
-        end
-    end
-end
-
--- wide base-class capture: registered LAZILY on first F6 (prime suspect for
--- the post-dump crash during terminal navigation; terminal class is known
--- now, so it is not needed for normal operation)
-local captureMode = false
-local wideRegistered = false
-local seenClasses = {}
-local function registerWideCapture()
-    if wideRegistered then return end
-    wideRegistered = true
-    local ok, err = pcall(function()
-        NotifyOnNewObject("/Script/UMG.UserWidget", guarded("wide-capture", function(obj)
-            local cn = className(obj)
-            if cn == nil then return end
-            if not seenClasses[cn] then
-                seenClasses[cn] = true
-                print("[Palws] CAPTURE widget: " .. cn .. "\n")
-            end
-        end))
-    end)
-    print("[Palws] wide capture register: " .. (ok and "ok" or ("FAILED " .. tostring(err))) .. "\n")
-end
-
--- ---------- polling trigger (creation events proved unreliable) ----------
-local terminalActive = false
-local pollNoteLogged = false
-
-local function probeActive(w)
-    -- CommonActivatableWidget: IsActivated(); generic: IsVisible(); Visibility prop
-    local okA, a = pcall(function() return w:IsActivated() end)
-    if okA and type(a) == "boolean" then return a, "IsActivated" end
-    local okV, v = pcall(function() return w:IsVisible() end)
-    if okV and type(v) == "boolean" then return v, "IsVisible" end
-    local okP, p = pcall(function() return w.Visibility end)
-    if okP and p ~= nil then
-        p = unwrap(p)
-        if type(p) == "number" then
-            -- ESlateVisibility: 0=Visible 1=Collapsed 2=Hidden 3/4=HitTestInvisible
-            return p == 0, "Visibility=" .. p
-        end
-        local s = fnameToString(p)
-        if s then
-            if s:find("Collapsed") or s:find("Hidden") then return false, "Visibility=" .. s end
-            if s:find("Visible") then return true, "Visibility=" .. s end
-        end
-    end
-    return nil, nil
-end
-
-local function pollTerminal()
-    local ok, obj = pcall(function() return FindFirstOf("WBP_PalStorageMenu_C") end)
-    if not (ok and isValid(obj)) then
-        if terminalActive then terminalActive = false end
-        if not pollNoteLogged then
-            pollNoteLogged = true
-            print("[Palws] poll: WBP_PalStorageMenu_C not found (yet)\n")
-        end
-        return
-    end
-    if pollNoteLogged then
-        pollNoteLogged = false
-        print("[Palws] poll: terminal widget instance acquired\n")
-    end
-    local active, how = probeActive(obj)
-    if active == nil then
-        if not pollNoteLogged then
-            pollNoteLogged = true
-            print("[Palws] poll: no activation probe worked (IsActivated/IsVisible/Visibility all failed)\n")
-        end
-        return
-    end
-    if active and not terminalActive then
-        terminalActive = true
-        lastWidget = obj
-        dirty = true
-        print("[Palws] poll: terminal OPEN detected via " .. tostring(how) .. "\n")
-    elseif (not active) and terminalActive then
-        terminalActive = false
-        print("[Palws] poll: terminal closed\n")
-    end
-end
-
-local function pump()
-    -- lazy class hooks: register NotifyOnNewObject once each candidate's class
-    -- is observed in the world (dynamic full-path registration)
-    sweepDynamicHooks()
-    pcall(pollTerminal)
-    if dirty then
-        dirty = false
-        ExecuteWithDelay(1500, guarded("pump-sync", function()
-            syncPalBoxAndDump("terminal-open")
-        end))
-    end
-    ExecuteWithDelay(500, pump)
-end
-ExecuteWithDelay(500, pump)
-
--- ---------- keys ----------
-RegisterKeyBind(Key.F6, guarded("F6", function()
-    captureMode = not captureMode
-    if captureMode then registerWideCapture() end
-    print("[Palws] capture " .. (captureMode and "ON (wide capture registered)" or "OFF") .. "\n")
-end))
-
-RegisterKeyBind(Key.F7, guarded("F7", function()
-    syncPalBoxAndDump("manual-f7")
-end))
-
--- ---------- F4: runtime introspection of one real pal parameter ----------
-local function describeValue(label, v)
-    local t = type(v)
-    local line = "[Palws]   introspect " .. label .. ": type=" .. t
-    if t == "userdata" then
-        line = line .. " valid=" .. tostring(isValid(v))
-        local okS, str = pcall(tostring, v)
-        if okS then line = line .. " tostring=" .. str end
-        local okT, ts = pcall(function() return v:ToString() end)
-        if okT then line = line .. " ToString=" .. tostring(ts) end
-    else
-        line = line .. " value=" .. tostring(v)
-    end
-    print(line .. "\n")
-end
-
-local function dissectElement(e, tag)
-    print("[Palws]   dissect " .. tag .. ": type=" .. type(e) .. "\n")
-    local ok1, r1 = pcall(tostring, e)
-    print("[Palws]     tostring: ok=" .. tostring(ok1) .. " -> " .. tostring(r1) .. "\n")
-    local ok2, r2 = pcall(function() return e:ToString() end)
-    print("[Palws]     :ToString(): ok=" .. tostring(ok2) .. " -> " .. tostring(r2) .. "\n")
-    local okG, g = pcall(function() return e.get end)
-    print("[Palws]     .get exists: " .. tostring(okG and type(g) == "function") .. "\n")
-    if okG and type(g) == "function" then
-        local ok3, r3 = pcall(function() return e:get() end)
-        print("[Palws]     :get(): ok=" .. tostring(ok3) .. " type=" .. type(r3) .. "\n")
-        if ok3 and r3 ~= nil then
-            local ok4, r4 = pcall(function() return r3:ToString() end)
-            print("[Palws]     :get():ToString(): ok=" .. tostring(ok4) .. " -> " .. tostring(r4) .. "\n")
-            local ok5, r5 = pcall(tostring, r3)
-            print("[Palws]     tostring(get()): ok=" .. tostring(ok5) .. " -> " .. tostring(r5) .. "\n")
-        end
-    end
-    for _, fn in ipairs({ "Name", "Value", "text", "Text" }) do
-        local okF, rf = pcall(function() return e[fn] end)
-        print("[Palws]     ." .. fn .. ": ok=" .. tostring(okF) .. " -> " .. tostring(rf) .. "\n")
-    end
-    local okP, rp = pcall(function()
-        local acc = {}
-        for k, v in pairs(e) do acc[#acc + 1] = tostring(k) .. "=" .. tostring(v) end
-        return table.concat(acc, ", ")
-    end)
-    print("[Palws]     pairs(): ok=" .. tostring(okP) .. " -> " .. tostring(rp) .. "\n")
-    local okTy, rTy = pcall(function() return e:type() end)
-    print("[Palws]     :type(): ok=" .. tostring(okTy) .. " -> " .. tostring(rTy) .. "\n")
-end
-
-local function introspectParam(param)
-    print("[Palws] introspect: param class=" .. tostring(className(param)) .. "\n")
-    -- GROUND TRUTH FIRST: full member lists of the parameter class
-    local cache = buildClassCache(param)
-    if cache then
-        local pn = {}
-        for k in pairs(cache.props) do pn[#pn + 1] = k end
-        table.sort(pn)
-        print("[Palws] PROP-LIST (" .. #pn .. "): " .. table.concat(pn, ", ") .. "\n")
-        local fn = {}
-        for k in pairs(cache.funcs) do fn[#fn + 1] = k end
-        table.sort(fn)
-        print("[Palws] FUNC-LIST (" .. #fn .. "): " .. table.concat(fn, ", ") .. "\n")
-    else
-        print("[Palws] buildClassCache failed\n")
-    end
-    local sc = buildStructCache(SAVEPARAM_STRUCT)
-    local sn = {}
-    for k in pairs(sc) do sn[#sn + 1] = k end
-    table.sort(sn)
-    print("[Palws] SAVEPARAM-FIELDS (" .. #sn .. "): " .. table.concat(sn, ", ") .. "\n")
-    -- candidate properties on the parameter object
-    for _, pn in ipairs({ "SaveParameter", "SaveParameterMirror", "Gender", "GenderType",
-        "NickName", "Nickname", "PassiveSkillList", "CharacterID", "Level" }) do
-        local cache0 = buildClassCache(param)
-        local pt = cache0 and cache0.ptypes[pn] or nil
-        if pt == "EnumProperty" or pt == "ByteProperty" then
-            print("[Palws]   introspect param." .. pn .. ": skipped-enum" .. "\n")
-        elseif cache0 and not cache0.props[pn] then
-            print("[Palws]   introspect param." .. pn .. ": not-in-whitelist" .. "\n")
-        else
-            print("[Palws]   introspect param." .. pn .. " reading (" .. tostring(pt) .. ")..." .. "\n")
-            local ok, v = pcall(function() return param[pn] end)
-            if ok then describeValue("param." .. pn, v) else print("[Palws]   introspect param." .. pn .. ": ERR" .. "\n") end
-        end
-    end
-    -- SaveParameter struct members
-    local sp = tryProp(param, "SaveParameter")
-    if sp ~= nil then
-        print("[Palws]   SaveParameter acquired, type=" .. type(sp) .. "\n")
-        for _, mn in ipairs({ "Gender", "NickName", "FilteredNickName", "PassiveSkillList",
-            "Talent_HP", "Talent_Melee", "Talent_Shot", "Talent_Defense", "Level", "Rank",
-            "Rank_HP", "Rank_Attack", "Rank_CraftSpeed" }) do
-            local ptype = structPropType(mn)
-            if ptype == "EnumProperty" or ptype == "ByteProperty" then
-                print("[Palws]   introspect sp." .. mn .. ": skipped-enum (" .. tostring(ptype) .. ")" .. "\n")
-            else
-                print("[Palws]   introspect sp." .. mn .. " reading (" .. tostring(ptype) .. ")..." .. "\n")
-                local ok, v = pcall(function() return sp[mn] end)
-                if ok then describeValue("sp." .. mn, v) else print("[Palws]   introspect sp." .. mn .. ": ERR" .. "\n") end
-            end
-        end
-        -- passive array dissection
-        local pl = tryProp(sp, "PassiveSkillList")
-        if pl ~= nil then
-            local okN, n = pcall(function() return #pl end)
-            print("[Palws]   sp.PassiveSkillList len: ok=" .. tostring(okN) .. " n=" .. tostring(n) .. "\n")
-            if okN and type(n) == "number" and n > 0 then
-                for i = 1, math.min(n, 2) do
-                    local okE, e = pcall(function() return pl[i] end)
-                    if okE then dissectElement(e, "passive[" .. i .. "]") end
-                end
-                -- pairs/ipairs directly on the array
-                local okP, rp = pcall(function()
-                    local acc = {}
-                    for i, v in ipairs(pl) do
-                        acc[#acc + 1] = i .. ":" .. type(v) .. "=" .. tostring(v)
-                        if #acc >= 4 then break end
-                    end
-                    return table.concat(acc, " | ")
-                end)
-                print("[Palws]   ipairs(array): ok=" .. tostring(okP) .. " -> " .. tostring(rp) .. "\n")
-            end
-        end
-    else
-        print("[Palws]   SaveParameter NOT readable\n")
-    end
-    -- candidate methods
-    for _, m in ipairs({ "GetGenderType", "GetGender", "GetNickname", "GetLevel", "GetSaveParameter", "GetPassiveSkillList" }) do
-        local ok, v = pcall(function() return param[m](param) end)
-        if ok then describeValue("param:" .. m .. "()", v) else print("[Palws]   introspect param:" .. m .. "(): ERR\n") end
-    end
-end
-
-local function introspectFirstPal()
-    local containers = getContainers()
     for _, c in ipairs(containers) do
-        local num = tryCall(c, "Num")
-        local n = type(num) == "number" and math.floor(num) or 0
-        for i = 0, math.min(n, 50) - 1 do
-            local okS, slot = pcall(function() return c:Get(i) end)
-            if okS and isValid(slot) then
-                local param = slotParam(slot)
-                if isValid(param) then
-                    introspectParam(param)
-                    return
+        if isValid(c) then
+            local addr = c:GetAddress()
+            if addr and not seen[addr] then
+                seen[addr] = true
+                cidx = cidx + 1
+                local okC, res = pcall(dumpContainerPals, c, cidx)
+                if okC and type(res) == "table" then
+                    for _, pj in ipairs(res) do all[#all + 1] = pj end
+                else
+                    print("[Palws] container " .. cidx .. " dump ERROR: " .. tostring(res) .. "\n")
                 end
             end
         end
     end
-    print("[Palws] introspect: no pal found in any container\n")
+    return all, { total = #all, containers = cidx + 1 }
 end
 
--- ---------- F4: memory mapping dump (calibrate struct layout by anchors) ----------
-local function memmapFirstPal()
-    if not palws or type(palws.hexdump) ~= "function" then
-        print("[Palws] memmap: hexdump not in dll\n")
-        return
-    end
-    local containers = getContainers()
-    for ci, c in ipairs(containers) do
-        local okN, num = pcall(function() return c:Num() end)
-        if okN and type(num) == "number" and num > 0 then
-            for i = 0, num - 1 do
-                local okS, slot = pcall(function() return c:Get(i) end)
-                if okS and isValid(slot) and tryCall(slot, "IsEmpty") == false then
-                    local param = slotParam(slot)
-                    if isValid(param) then
-                        print("[Palws] memmap: container " .. ci .. " slot " .. i .. "\n")
-                        print("[Palws] memmap anchor species=" .. tostring(readSpecies(param))
-                            .. " level=" .. tostring(readLevel(param)) .. "\n")
-                        local okPA, paddr = pcall(function() return param:GetAddress() end)
-                        print("[Palws] memmap param addr: ok=" .. tostring(okPA)
-                            .. " addr=" .. tostring(paddr) .. "\n")
-                        if okPA and type(paddr) == "number" and paddr > 0 then
-                            pcall(palws.hexdump, paddr, 0x800)
-                        end
-                        local sp = safeProp(param, "SaveParameter", "struct")
-                        if sp ~= nil then
-                            local okSA, saddr = pcall(function() return sp:GetAddress() end)
-                            print("[Palws] memmap saveparam addr: ok=" .. tostring(okSA)
-                                .. " addr=" .. tostring(saddr) .. "\n")
-                            if okSA and type(saddr) == "number" and saddr > 0 then
-                                pcall(palws.hexdump, saddr, 0x100)
-                            end
-                            -- favorite/rare fields: try direct struct-member reads
-                            -- (BoolProperty/ByteProperty — not enum, may work)
-                            for _, f in ipairs({ "IsFavoritePal", "FavoriteIndex", "IsRarePal" }) do
-                                local okF, v = pcall(function() return sp[f] end)
-                                print("[Palws] memmap sp." .. f .. ": ok=" .. tostring(okF)
-                                    .. " v=" .. tostring(v) .. " type=" .. type(v) .. "\n")
-                            end
-                        end
-                        return
-                    end
-                end
-            end
-        end
-    end
-    print("[Palws] memmap: no pal found\n")
-end
-
--- ---------- F3: favorite field scan (are IsFavoritePal/FavoriteIndex live?) ----------
-local function favoriteScan()
-    local containers = getContainers()
-    local total, favTrue, idxNonZero, rareTrue, samples = 0, 0, 0, 0, {}
-    for _, c in ipairs(containers) do
-        local okN, num = pcall(function() return c:Num() end)
-        if okN and type(num) == "number" and num > 0 then
-            for i = 0, math.min(num, MAX_DUMP_PALS) - 1 do
-                local okS, slot = pcall(function() return c:Get(i) end)
-                if okS and isValid(slot) and tryCall(slot, "IsEmpty") == false then
-                    local param = slotParam(slot)
-                    if isValid(param) then
-                        total = total + 1
-                        local sp = safeProp(param, "SaveParameter", "struct")
-                        if sp ~= nil then
-                            local _, fav = pcall(function() return sp.IsFavoritePal end)
-                            local _, idx = pcall(function() return sp.FavoriteIndex end)
-                            local _, rare = pcall(function() return sp.IsRarePal end)
-                            local species = tostring(readSpecies(param))
-                            if rare == true then
-                                rareTrue = rareTrue + 1
-                                -- sample rare pals WITHOUT boss prefix (decides rare=alpha or lucky)
-                                if not species:match("^BOSS_") and not species:match("^Boss_")
-                                    and #samples < 12 then
-                                    samples[#samples + 1] = species .. " rare=true idx=" .. tostring(idx)
-                                end
-                            end
-                            if fav == true then
-                                favTrue = favTrue + 1
-                            elseif type(idx) == "number" and idx ~= 0 then
-                                idxNonZero = idxNonZero + 1
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-    print("[Palws] favscan: total=" .. total .. " favTrue=" .. favTrue
-        .. " idxNonZero=" .. idxNonZero .. " rareTrue=" .. rareTrue .. "\n")
-    for _, s in ipairs(samples) do print("[Palws]   " .. s .. "\n") end
-end
-
-RegisterKeyBind(Key.F3, guarded("F3", function()
-    ExecuteInGameThread(guarded("favscan", function()
-        pcall(favoriteScan)
-    end))
-end))
-
-RegisterKeyBind(Key.F4, guarded("F4", function()
-    ExecuteInGameThread(guarded("memmap", function()
-        pcall(memmapFirstPal)
-    end))
-end))
-
-RegisterKeyBind(Key.F5, guarded("F5", function()
-    ExecuteInGameThread(guarded("deepdiag", function()
-        if isValid(lastWidget) then
-            walkObjectProps(lastWidget, className(lastWidget) or "widget")
-        end
-        local okM, mgr = pcall(function() return FindFirstOf("PalCharacterContainerManager") end)
-        if okM and isValid(mgr) then walkObjectProps(mgr, "PalCharacterContainerManager") end
-        local okS, sub = pcall(function() return FindFirstOf("PalGlobalPalStorageSubsystem") end)
-        if okS and isValid(sub) then walkObjectProps(sub, "PalGlobalPalStorageSubsystem") end
-        -- box paging diagnostics: how many UI models, page counts, containers
-        local okU, uis = pcall(function() return FindAllOf("PalUIPalBoxBase") end)
-        print("[Palws] F5: PalUIPalBoxBase count=" .. tostring(okU and #uis or "err") .. "\n")
-        if okU then
-            for _, ui in ipairs(uis) do
-                local okN, n = pcall(function() return ui:GetBoxMaxPageNum() end)
-                print("[Palws]   boxUI addr=" .. tostring(ui:GetAddress())
-                    .. " maxPage=" .. tostring(okN and n or "?"))
-            end
-        end
-        local okP, models = pcall(function() return FindAllOf("PalUIPalStorageModel") end)
-        print("[Palws] F5: PalUIPalStorageModel count=" .. tostring(okP and models and #models or "err") .. "\n")
-        if okP and type(models) == "table" then
-            for _, m in ipairs(models) do
-                local okN, n = pcall(function() return m:GetWholePageCount() end)
-                local okT, tgt = pcall(function() return m:GetTargetContainerId() end)
-                print("[Palws]   model addr=" .. tostring(m:GetAddress())
-                    .. " wholePages=" .. tostring(okN and n or "?")
-                    .. " target=" .. tostring(okT and tostring(tgt) or "?"))
-            end
-        end
-        local okC, cons = pcall(function() return FindAllOf("PalIndividualCharacterContainer") end)
-        print("[Palws] F5: containers=" .. tostring(okC and #cons or "err") .. "\n")
-        if okC then
-            for _, c in ipairs(cons) do
-                local num = tryCall(c, "Num")
-                local slots = tryCall(c, "GetSlots")
-                local n = slots and #slots or num
-                print("[Palws]   container addr=" .. tostring(c:GetAddress()) .. " n=" .. tostring(n))
-            end
-        end
-        census()
-    end))
-end))
-
-RegisterKeyBind(Key.F8, guarded("F8", function()
-    local json = '{"version":1,"source":"palws","event":"fake-f8","pals":['
-        .. '{"species":"PinkCat","gender":"male","passives":["Brave","BurlyBody"],"nickname":"测试猫","level":12},'
-        .. '{"species":"CaptainPenguin","gender":"female","passives":["Workaholic"],"nickname":"Penking","level":34},'
-        .. '{"species":"NegativeKoala","gender":"unknown","passives":[],"nickname":null,"level":5}'
-        .. "]}"
-    broadcastJson(json)
-end))
-
--- ---------- F9: server-side PalBox replication experiment ----------
--- Ask the owning PlayerState to force PalBox slot replication, then observe
--- the native OnRep callback for five seconds. This deliberately does not read
--- pal fields, scan the 960-slot container, turn pages, or broadcast a payload.
-local forceSyncExperiment = {
-    active = false,
-    mode = nil,
-    callbacks = 0,
-    callbackErrors = 0,
-    requestedPages = 0,
-    requestErrors = 0,
-    uniqueSlots = {},
-    pages = {},
-    minSlot = nil,
-    maxSlot = nil,
-}
-
+-- ---------- local player state ----------
 local function getLocalPlayerState()
     local ok, controllers = pcall(function() return FindAllOf("PlayerController") end)
     if not (ok and type(controllers) == "table") then return nil end
@@ -1235,320 +562,171 @@ local function getLocalPlayerState()
     return nil
 end
 
-local function resetForceSyncExperiment()
-    forceSyncExperiment.mode = nil
-    forceSyncExperiment.callbacks = 0
-    forceSyncExperiment.callbackErrors = 0
-    forceSyncExperiment.requestedPages = 0
-    forceSyncExperiment.requestErrors = 0
-    forceSyncExperiment.uniqueSlots = {}
-    forceSyncExperiment.pages = {}
-    forceSyncExperiment.minSlot = nil
-    forceSyncExperiment.maxSlot = nil
-end
+-- ---------- sync state machine ----------
+-- syncState only ever holds plain values; never a UObject across timer callbacks.
+local syncState = {
+    phase = "idle",
+    runId = 0,
+    requestId = nil,
+    trigger = nil,
+    nextPage = 0,
+    requestedPages = 0,
+    requestErrors = 0,
+}
+local lastAttemptAtSec = -SYNC_COOLDOWN_SEC
 
-local function countForceSyncEntries(entries)
-    local count = 0
-    for _ in pairs(entries) do count = count + 1 end
-    return count
-end
-
-local function finishForceSyncExperiment(playerState)
-    local okDisable, disableErr = pcall(function()
-        if isValid(playerState) then
-            playerState:RequestForceSyncPalBoxSlot_ToServer(false)
-        end
-    end)
-    forceSyncExperiment.active = false
-    print(string.format(
-        "[Palws] force-sync result: mode=%s requestedPages=%d requestErrors=%d callbacks=%d uniqueSlots=%d pages=%d slotRange=%s..%s callbackErrors=%d disable=%s\n",
-        tostring(forceSyncExperiment.mode),
-        forceSyncExperiment.requestedPages,
-        forceSyncExperiment.requestErrors,
-        forceSyncExperiment.callbacks,
-        countForceSyncEntries(forceSyncExperiment.uniqueSlots),
-        countForceSyncEntries(forceSyncExperiment.pages),
-        tostring(forceSyncExperiment.minSlot),
-        tostring(forceSyncExperiment.maxSlot),
-        forceSyncExperiment.callbackErrors,
-        okDisable and "ok" or ("FAILED " .. tostring(disableErr))))
-end
-
-local function finishPalBoxSyncAndDump(playerState, reason)
-    print("[Palws] page-sync replication settled; scanning containers\n")
-    local okDump, dumpErr = pcall(dumpAll, reason)
-    if not okDump then
-        print("[Palws] dumpAll ERROR after page sync: " .. tostring(dumpErr) .. "\n")
-    end
-    finishForceSyncExperiment(playerState)
-end
-
--- Production path used by terminal-open and F7. Force slot replication,
--- explicitly request all 32 server pages, allow their OnRep callbacks to
--- settle, then scan the single 960-slot PalBox container and broadcast once.
-syncPalBoxAndDump = function(reason)
-    if forceSyncExperiment.active then
-        print("[Palws] page-sync dump skipped: another sync is active\n")
-        return false
-    end
-
-    ExecuteInGameThread(guarded("page-sync-dump-start", function()
-        local playerState = getLocalPlayerState()
-        if not isValid(playerState) then
-            print("[Palws] page-sync dump: local PlayerState not found; using cached slots\n")
-            local okDump, dumpErr = pcall(dumpAll, reason)
-            if not okDump then print("[Palws] dumpAll ERROR: " .. tostring(dumpErr) .. "\n") end
-            return
-        end
-
-        resetForceSyncExperiment()
-        forceSyncExperiment.mode = "sync-and-dump"
-        forceSyncExperiment.active = true
-        local okEnable, enableErr = pcall(function()
-            playerState:RequestForceSyncPalBoxSlot_ToServer(true)
-        end)
-        if not okEnable then
-            forceSyncExperiment.active = false
-            print("[Palws] page-sync dump force enable FAILED: " .. tostring(enableErr)
-                .. "; using cached slots\n")
-            local okDump, dumpErr = pcall(dumpAll, reason)
-            if not okDump then print("[Palws] dumpAll ERROR: " .. tostring(dumpErr) .. "\n") end
-            return
-        end
-        print(string.format(
-            "[Palws] page-sync dump enabled; requesting pages 0..%d at %dms intervals\n",
-            PALBOX_PAGE_COUNT - 1, PALBOX_PAGE_REQUEST_DELAY_MS))
-
-        local nextPage = 0
-        local requestNextPage
-        requestNextPage = function()
-            ExecuteInGameThread(function()
-                local okStep, stepErr = pcall(function()
-                    if not forceSyncExperiment.active or not isValid(playerState) then
-                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
-                        finishPalBoxSyncAndDump(playerState, reason)
-                        return
-                    end
-
-                    local page = nextPage
-                    local okRequest, requestErr = pcall(function()
-                        playerState:RequestPalBoxSyncPage_ToServer(page)
-                    end)
-                    if okRequest then
-                        forceSyncExperiment.requestedPages = forceSyncExperiment.requestedPages + 1
-                    else
-                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
-                        print("[Palws] page-sync dump request " .. page .. " FAILED: "
-                            .. tostring(requestErr) .. "\n")
-                    end
-
-                    nextPage = nextPage + 1
-                    if nextPage < PALBOX_PAGE_COUNT then
-                        ExecuteWithDelay(PALBOX_PAGE_REQUEST_DELAY_MS, requestNextPage)
-                    else
-                        print("[Palws] page-sync dump requests sent; waiting for replication\n")
-                        ExecuteWithDelay(PALBOX_REPLICATION_SETTLE_MS,
-                            guarded("page-sync-dump-finish-delay", function()
-                                ExecuteInGameThread(guarded("page-sync-dump-finish", function()
-                                    finishPalBoxSyncAndDump(playerState, reason)
-                                end))
-                            end))
-                    end
-                end)
-                if not okStep then
-                    forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
-                    print("[Palws] page-sync dump step FAILED: " .. tostring(stepErr) .. "\n")
-                    finishPalBoxSyncAndDump(playerState, reason)
-                end
-            end)
-        end
-        requestNextPage()
+local function scheduleOnGameThread(delayMs, fn)
+    ExecuteWithDelay(delayMs, guarded("delay", function()
+        ExecuteInGameThread(guarded("step", fn))
     end))
+end
+
+local function failSync(runId, code, message, retryable)
+    if syncState.runId ~= runId then return end
+    local ps = getLocalPlayerState()
+    if isValid(ps) then
+        pcall(function() ps:RequestForceSyncPalBoxSlot_ToServer(false) end)
+    end
+    emitError(code, message, syncState.requestId, retryable)
+    emitStatus("failed", syncState.requestId, syncState.requestedPages, PALBOX_PAGE_COUNT, syncState.trigger)
+    print("[Palws] sync failed: " .. code .. " - " .. message .. "\n")
+    syncState.phase = "idle"
+    syncState.requestId = nil
+    syncState.trigger = nil
+end
+
+local function finishSync(runId)
+    if syncState.runId ~= runId then return end
+    local ps = getLocalPlayerState()
+    if isValid(ps) then
+        pcall(function() ps:RequestForceSyncPalBoxSlot_ToServer(false) end)
+    end
+    syncState.phase = "collecting"
+    emitStatus("collecting", syncState.requestId, syncState.requestedPages, PALBOX_PAGE_COUNT, syncState.trigger)
+    local okColl, pals, stats = pcall(collectAllPals)
+    if not okColl then
+        failSync(runId, "collect-failed", tostring(pals), true)
+        return
+    end
+    syncState.phase = "broadcasting"
+    emitStatus("broadcasting", syncState.requestId, syncState.requestedPages, PALBOX_PAGE_COUNT, syncState.trigger)
+    emitSnapshot(syncState.requestId, pals, stats.total, syncState.requestedPages, syncState.requestErrors, stats.containers)
+    emitStatus("complete", syncState.requestId, syncState.requestedPages, PALBOX_PAGE_COUNT, syncState.trigger)
+    print("[Palws] sync complete: " .. stats.total .. " pals from " .. stats.containers .. " containers\n")
+    syncState.phase = "idle"
+    syncState.requestId = nil
+    syncState.trigger = nil
+end
+
+local function requestNextPage(runId)
+    if syncState.runId ~= runId or syncState.phase ~= "requesting" then return end
+    local playerState = getLocalPlayerState()
+    if not isValid(playerState) then
+        failSync(runId, "player-state-unavailable", "当前未进入可同步的游戏世界", true)
+        return
+    end
+    local page = syncState.nextPage
+    local okRequest, reqErr = pcall(function() playerState:RequestPalBoxSyncPage_ToServer(page) end)
+    if okRequest then
+        syncState.requestedPages = syncState.requestedPages + 1
+    else
+        syncState.requestErrors = syncState.requestErrors + 1
+        emitLog("warn", "page " .. page .. " request failed: " .. tostring(reqErr), syncState.requestId)
+    end
+    emitStatus("requesting", syncState.requestId, syncState.requestedPages, PALBOX_PAGE_COUNT, syncState.trigger)
+    syncState.nextPage = page + 1
+    if syncState.nextPage < PALBOX_PAGE_COUNT then
+        scheduleOnGameThread(PALBOX_PAGE_REQUEST_DELAY_MS, function() requestNextPage(runId) end)
+    else
+        syncState.phase = "settling"
+        emitStatus("settling", syncState.requestId, syncState.requestedPages, PALBOX_PAGE_COUNT, syncState.trigger)
+        scheduleOnGameThread(PALBOX_REPLICATION_SETTLE_MS, function() finishSync(runId) end)
+    end
+end
+
+local function startSyncRun(runId)
+    if syncState.runId ~= runId or syncState.phase ~= "requesting" then return end
+    local playerState = getLocalPlayerState()
+    if not isValid(playerState) then
+        failSync(runId, "player-state-unavailable", "当前未进入可同步的游戏世界", true)
+        return
+    end
+    local okEnable, enableErr = pcall(function() playerState:RequestForceSyncPalBoxSlot_ToServer(true) end)
+    if not okEnable then
+        failSync(runId, "force-sync-enable-failed", tostring(enableErr), true)
+        return
+    end
+    emitStatus("requesting", syncState.requestId, 0, PALBOX_PAGE_COUNT, syncState.trigger)
+    requestNextPage(runId)
+end
+
+-- The single explicit sync entry point. Returns whether the async run started.
+local function requestSnapshot(opts)
+    opts = opts or {}
+    if not palws or type(palws.broadcast) ~= "function" then
+        return false, "native-error"
+    end
+    if syncState.phase ~= "idle" then
+        return false, "busy"
+    end
+    local now = os.time()
+    if now - lastAttemptAtSec < SYNC_COOLDOWN_SEC then
+        return false, "cooldown"
+    end
+    lastAttemptAtSec = now
+    syncState.runId = syncState.runId + 1
+    local runId = syncState.runId
+    syncState.phase = "requesting"
+    syncState.trigger = opts.trigger or "keybind"
+    syncState.requestId = opts.requestId
+    syncState.nextPage = 0
+    syncState.requestedPages = 0
+    syncState.requestErrors = 0
+    emitStatus("queued", syncState.requestId, 0, PALBOX_PAGE_COUNT, syncState.trigger)
+    ExecuteInGameThread(guarded("request-snapshot", function() startSyncRun(runId) end))
     return true
 end
 
-local okRepHook, repHookErr = pcall(function()
-    RegisterHook("/Script/Pal.PalIndividualCharacterSlot:OnRep_Parameter",
-        function(Context)
-            if not forceSyncExperiment.active then return end
-            local ok = pcall(function()
-                local slot = Context:get()
-                if not isValid(slot) then return end
-
-                forceSyncExperiment.callbacks = forceSyncExperiment.callbacks + 1
-                local okAddr, addr = pcall(function() return slot:GetAddress() end)
-                if okAddr then forceSyncExperiment.uniqueSlots[tostring(addr)] = true end
-
-                local okIndex, index = pcall(function() return slot:GetSlotIndex() end)
-                if okIndex and type(index) == "number" and index >= 0 then
-                    local page = math.floor(index / 30)
-                    forceSyncExperiment.pages[page] = true
-                    if forceSyncExperiment.minSlot == nil or index < forceSyncExperiment.minSlot then
-                        forceSyncExperiment.minSlot = index
-                    end
-                    if forceSyncExperiment.maxSlot == nil or index > forceSyncExperiment.maxSlot then
-                        forceSyncExperiment.maxSlot = index
-                    end
-                end
-            end)
-            if not ok then
-                forceSyncExperiment.callbackErrors = forceSyncExperiment.callbackErrors + 1
-            end
-        end)
-end)
-print("[Palws] force-sync OnRep hook: "
-    .. (okRepHook and "ok" or ("FAILED " .. tostring(repHookErr))) .. "\n")
-
-RegisterKeyBind(Key.F9, guarded("F9", function()
-    if forceSyncExperiment.active then
-        print("[Palws] force-sync experiment already active\n")
-        return
-    end
-    ExecuteInGameThread(guarded("force-sync-start", function()
-        local playerState = getLocalPlayerState()
-        if not isValid(playerState) then
-            print("[Palws] force-sync: local PlayerState not found\n")
-            return
-        end
-
-        resetForceSyncExperiment()
-        forceSyncExperiment.mode = "force-only"
-        forceSyncExperiment.active = true
-        local okEnable, enableErr = pcall(function()
-            playerState:RequestForceSyncPalBoxSlot_ToServer(true)
-        end)
-        if not okEnable then
-            forceSyncExperiment.active = false
-            print("[Palws] force-sync enable FAILED: " .. tostring(enableErr) .. "\n")
-            return
-        end
-        print("[Palws] force-sync enabled; observing OnRep_Parameter for 5s\n")
-
-        ExecuteWithDelay(5000, guarded("force-sync-finish-delay", function()
-            ExecuteInGameThread(guarded("force-sync-finish", function()
-                finishForceSyncExperiment(playerState)
-            end))
-        end))
-    end))
-end))
-
-RegisterKeyBind(Key.F10, guarded("F10", function()
-    if forceSyncExperiment.active then
-        print("[Palws] force-sync experiment already active\n")
-        return
-    end
-    ExecuteInGameThread(guarded("page-sync-start", function()
-        local playerState = getLocalPlayerState()
-        if not isValid(playerState) then
-            print("[Palws] page-sync: local PlayerState not found\n")
-            return
-        end
-
-        resetForceSyncExperiment()
-        forceSyncExperiment.mode = "force-plus-pages"
-        forceSyncExperiment.active = true
-        local okEnable, enableErr = pcall(function()
-            playerState:RequestForceSyncPalBoxSlot_ToServer(true)
-        end)
-        if not okEnable then
-            forceSyncExperiment.active = false
-            print("[Palws] page-sync force enable FAILED: " .. tostring(enableErr) .. "\n")
-            return
-        end
-        print(string.format("[Palws] page-sync enabled; requesting pages 0..%d at %dms intervals\n",
-            PALBOX_PAGE_COUNT - 1, PALBOX_PAGE_REQUEST_DELAY_MS))
-
-        local nextPage = 0
-        local requestNextPage
-        requestNextPage = function()
-            ExecuteInGameThread(function()
-                local okStep, stepErr = pcall(function()
-                    if not forceSyncExperiment.active or not isValid(playerState) then
-                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
-                        finishForceSyncExperiment(playerState)
-                        return
-                    end
-
-                    local page = nextPage
-                    local okRequest, requestErr = pcall(function()
-                        playerState:RequestPalBoxSyncPage_ToServer(page)
-                    end)
-                    if okRequest then
-                        forceSyncExperiment.requestedPages = forceSyncExperiment.requestedPages + 1
-                    else
-                        forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
-                        print("[Palws] page-sync request " .. page .. " FAILED: "
-                            .. tostring(requestErr) .. "\n")
-                    end
-
-                    nextPage = nextPage + 1
-                    if nextPage < PALBOX_PAGE_COUNT then
-                        ExecuteWithDelay(PALBOX_PAGE_REQUEST_DELAY_MS, requestNextPage)
-                    else
-                        print("[Palws] page-sync requests sent; waiting 3s for replication\n")
-                        ExecuteWithDelay(PALBOX_REPLICATION_SETTLE_MS, guarded("page-sync-finish-delay", function()
-                            ExecuteInGameThread(guarded("page-sync-finish", function()
-                                finishForceSyncExperiment(playerState)
-                            end))
-                        end))
-                    end
-                end)
-                if not okStep then
-                    forceSyncExperiment.requestErrors = forceSyncExperiment.requestErrors + 1
-                    print("[Palws] page-sync step FAILED: " .. tostring(stepErr) .. "\n")
-                    finishForceSyncExperiment(playerState)
-                end
-            end)
-        end
-        requestNextPage()
-    end))
-end))
-
--- ---------- load-time self-check: every critical function must be callable ----------
-do
-    local required = {
-        "isValid", "className", "jsonEscape", "jsonStr", "broadcastJson",
-        "tryCall", "tryProp", "fnameToString", "unwrap", "looksLikeObjectDump",
-        "isShell", "validShape", "safeCall", "safeProp", "safeStructProp",
-        "structPropType", "mapGenderNumber", "mapGenderString",
-        "readNickname", "readSpecies", "readGender", "readLevel", "readPassives",
-        "readField", "buildPalJson", "slotParam", "probeSlot",
-        "getContainers", "containerSummary", "dumpContainerPals", "dumpAll",
-        "walkObjectProps", "census", "pollTerminal", "pump",
-        "getLocalPlayerState", "resetForceSyncExperiment", "countForceSyncEntries",
-        "finishForceSyncExperiment", "finishPalBoxSyncAndDump", "syncPalBoxAndDump",
-        "buildClassCache", "buildStructCache",
-    }
-    local scope = {
-        isValid=isValid, className=className, jsonEscape=jsonEscape, jsonStr=jsonStr,
-        broadcastJson=broadcastJson, tryCall=tryCall, tryProp=tryProp,
-        fnameToString=fnameToString, unwrap=unwrap, looksLikeObjectDump=looksLikeObjectDump,
-        isShell=isShell, validShape=validShape, safeCall=safeCall, safeProp=safeProp,
-        safeStructProp=safeStructProp, structPropType=structPropType,
-        mapGenderNumber=mapGenderNumber, mapGenderString=mapGenderString,
-        readNickname=readNickname, readSpecies=readSpecies, readGender=readGender,
-        readLevel=readLevel, readPassives=readPassives, readField=readField,
-        buildPalJson=buildPalJson, slotParam=slotParam, probeSlot=probeSlot,
-        getContainers=getContainers, containerSummary=containerSummary,
-        dumpContainerPals=dumpContainerPals, dumpAll=dumpAll,
-        walkObjectProps=walkObjectProps, census=census, pollTerminal=pollTerminal, pump=pump,
-        getLocalPlayerState=getLocalPlayerState,
-        resetForceSyncExperiment=resetForceSyncExperiment,
-        countForceSyncEntries=countForceSyncEntries,
-        finishForceSyncExperiment=finishForceSyncExperiment,
-        finishPalBoxSyncAndDump=finishPalBoxSyncAndDump,
-        syncPalBoxAndDump=syncPalBoxAndDump,
-        buildClassCache=buildClassCache, buildStructCache=buildStructCache,
-    }
-    local fails = {}
-    for _, n in ipairs(required) do
-        if type(scope[n]) ~= "function" then fails[#fails + 1] = n end
-    end
-    if #fails == 0 then
-        print("[Palws] SELF-CHECK PASS (" .. #required .. " functions)" .. "\n")
-    else
-        print("[Palws] SELF-CHECK FAIL: " .. table.concat(fails, ", ") .. "\n")
-    end
+-- ---------- command pump (web refresh) ----------
+local function reasonMessage(why)
+    if why == "busy" then return "已有同步任务进行中" end
+    if why == "cooldown" then return "触发过于频繁，请稍后再试" end
+    if why == "native-error" then return "原生模块不可用" end
+    if why == "not-ready" then return "当前未进入可同步的游戏世界" end
+    return "同步请求被拒绝"
 end
 
-print("[Palws] loaded. F5=deep-diag F6=capture F7=dump F8=fake\n")
+local function commandPump()
+    if palws and type(palws.take_command) == "function" then
+        local ok, cmdJson = pcall(palws.take_command)
+        if ok and type(cmdJson) == "string" and cmdJson ~= "" then
+            local ctype = jsonField(cmdJson, "type")
+            local cid = jsonField(cmdJson, "id")
+            if ctype == "snapshot.request" then
+                local okReq, why = requestSnapshot({ trigger = "web", requestId = cid })
+                if okReq then
+                    print("[Palws] web snapshot accepted (id=" .. tostring(cid) .. ")\n")
+                else
+                    print("[Palws] web snapshot rejected: " .. tostring(why) .. "\n")
+                    emitError(why or "busy", reasonMessage(why), cid,
+                        why == "busy" or why == "cooldown" or why == "not-ready")
+                end
+            else
+                print("[Palws] command ignored: " .. tostring(ctype) .. "\n")
+            end
+        end
+    end
+    ExecuteWithDelay(COMMAND_PUMP_INTERVAL_MS, commandPump)
+end
+ExecuteWithDelay(COMMAND_PUMP_INTERVAL_MS, commandPump)
+
+-- ---------- keys ----------
+RegisterKeyBind(Key.F7, guarded("F7", function()
+    local ok, why = requestSnapshot({ trigger = "keybind" })
+    if not ok then
+        print("[Palws] F7 sync not started: " .. tostring(why) .. "\n")
+        emitLog("warn", "同步未启动: " .. tostring(why), nil)
+    end
+end))
+
+print("[Palws] loaded. F7 = request snapshot\n")

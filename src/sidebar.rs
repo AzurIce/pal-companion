@@ -311,8 +311,6 @@ pub fn OwnedSidebar() -> Element {
                         Segmented { options: opts.clone(), value: base_tab }
                     }
                 }
-                // 游戏同步提示条（有待确认列表时出现）
-                crate::sync_client::SyncBanner {}
                 div { class: "sidebar-list",
                     if list.is_empty() {
                         div { class: "sidebar-empty",

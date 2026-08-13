@@ -2,25 +2,43 @@
 //! each `require "palws"` (same dll) and calling start_server twice.
 //! If the dll mis-handles reload (non-idempotent globals, panics), this
 //! crashes or errors here instead of inside the game.
+//!
+//! Build the dll first, then run:
+//!   cargo build --release -p palws
+//!   cargo run --example reload_harness -p palws
 use mlua_sys::*;
 use std::ffi::CString;
 
-unsafe fn run_session(tag: &str) {
+/// Absolute cpath to the workspace's release dll, with forward slashes for Lua.
+fn dll_cpath() -> String {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("release");
+    let s = dir.to_string_lossy().replace('\\', "/");
+    format!("{s}/?.dll")
+}
+
+unsafe fn run_session(tag: &str, cpath: &str) {
     let l = luaL_newstate();
     assert!(!l.is_null(), "luaL_newstate failed");
     luaL_openlibs(l);
     let code = format!(
         r#"
-package.cpath = [[C:\Users\xiaob\palworld-dump\palws-spike\target\release\?.dll]]
+package.cpath = [[{cpath}]] .. ";" .. package.cpath
 local m = require "palws"
 print("[{tag}] backend:", m.backend)
 print("[{tag}] start_server #1:", m.start_server(32123))
-print("[{tag}] ping:", m.ping())
 print("[{tag}] version:", m.version())
+print("[{tag}] client_count:", m.client_count())
+print("[{tag}] broadcast valid:", m.broadcast([=[{{"protocol":"palws","version":1,"type":"log","id":"lua-1","payload":{{"level":"info","source":"lua","message":"hi"}}}}]=]))
+print("[{tag}] broadcast invalid:", m.broadcast("not json"))
+print("[{tag}] take_command (empty):", tostring(m.take_command()))
 print("[{tag}] start_server #2:", m.start_server(32123))
-print("[{tag}] echo:", m.echo("hello from {tag}"))
 "#,
-        tag = tag
+        tag = tag,
+        cpath = cpath,
     );
     let c = CString::new(code).unwrap();
     let rc = luaL_loadstring(l, c.as_ptr());
@@ -41,10 +59,12 @@ print("[{tag}] echo:", m.echo("hello from {tag}"))
 }
 
 fn main() {
+    let cpath = dll_cpath();
+    println!("using package.cpath = {cpath}");
     unsafe {
-        run_session("one");
-        run_session("two");
-        run_session("three");
+        run_session("one", &cpath);
+        run_session("two", &cpath);
+        run_session("three", &cpath);
     }
     println!("HARNESS DONE");
 }

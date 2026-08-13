@@ -1186,6 +1186,119 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 .sync-status-dot--on,
 .sync-status-dot--synced { background: hsl(142 71% 45%); opacity: 1; }
 
+.sync-status-dot--err { background: hsl(0 72% 51%); opacity: 1; }
+
+.sync-status-phase { color: var(--muted-foreground); }
+
+/* 同步进度条（页脚内联） */
+.sync-progress {
+    width: 110px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--muted);
+    overflow: hidden;
+    flex: none;
+}
+
+.sync-progress-fill {
+    height: 100%;
+    background: hsl(217 91% 60%);
+    border-radius: 999px;
+    transition: width .25s ease;
+}
+
+/* 同步结果条 */
+.sync-result { padding: 6px 8px; border-radius: var(--radius, 6px); margin-bottom: 6px; }
+.sync-result--ok { background: hsl(142 71% 45% / .12); color: hsl(142 71% 30%); }
+.sync-result--err { background: hsl(0 72% 51% / .12); color: hsl(0 72% 40%); }
+
+/* 右下角日志面板 + 悬浮按钮 */
+.sync-console-fab {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 200;
+    width: 40px;
+    height: 40px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--card);
+    color: var(--foreground);
+    cursor: pointer;
+    box-shadow: 0 4px 16px rgba(0,0,0,.18);
+}
+
+.sync-console-fab:hover { border-color: var(--primary, hsl(217 91% 60%)); }
+
+.sync-console-badge {
+    position: absolute;
+    top: -4px;
+    right: -4px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 999px;
+    background: hsl(0 72% 51%);
+    color: #fff;
+    font-size: 10px;
+    line-height: 16px;
+    text-align: center;
+}
+
+.sync-console {
+    position: fixed;
+    right: 16px;
+    bottom: 66px;
+    z-index: 200;
+    width: min(360px, calc(100vw - 32px));
+    border: 1px solid var(--border);
+    border-radius: var(--radius, 10px);
+    background: var(--card);
+    box-shadow: 0 8px 32px rgba(0,0,0,.24);
+    padding: 10px 12px;
+    font-size: 12px;
+}
+
+.sync-console-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 6px;
+}
+
+.sync-console-title { font-weight: 600; }
+
+.sync-console-log {
+    max-height: 40vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    user-select: text;
+    cursor: text;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius, 6px);
+    background: var(--muted);
+}
+
+.sync-console-empty { color: var(--muted-foreground); }
+
+.sync-console-entry {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+    font-size: 11.5px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.sync-console-entry--info { color: var(--foreground); }
+.sync-console-entry--warn { color: hsl(45 93% 40%); }
+.sync-console-entry--error { color: hsl(0 72% 51%); }
+
 /* 持有列表：图鉴编号 */
 .dex-no { color: var(--muted-foreground); font-size: 12px; margin-right: 4px; }
 /* 编辑弹窗：被动效果描述 */

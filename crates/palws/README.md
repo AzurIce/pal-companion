@@ -1,62 +1,53 @@
-# palws — Palworld WebSocket broadcast mod (UE4SS)
+# palws — Palworld WebSocket 同步 Mod（UE4SS）
 
-Lua mod for UE4SS that loads a Rust native module (`palws.dll`) providing a
-WebSocket broadcast server + static HTTP file server on `127.0.0.1`, used by
-external tools (pal-companion etc.).
+UE4SS Lua Mod，加载一个 Rust 原生模块（`palws.dll`），在 `127.0.0.1` 提供
+WebSocket 服务，供外部工具（pal-companion 等）显式同步游戏内的帕鲁数据。
 
-## Layout
+## 布局
 
-- `src/lib.rs` — Rust cdylib. Vendored stock Lua 5.4 (`mlua-sys`), so it talks
-  the same Lua 5.4 ABI as UE4SS's embedded interpreter. Axum (tokio) for
-  WebSocket broadcast + HTTP static file serving. All entry points are
-  `catch_unwind`-hardened for hot reload.
-- `lua/main.lua` — the UE4SS mod script; `require('palws')` and wires keybinds,
-  hooks, and the WS/HTTP server lifecycle. **This file is the authoritative
-  working copy; game-dir copies are deployments.**
-- `examples/reload_harness.rs` — hot-reload test harness.
-- `scripts/build.sh` — build + deploy to the Workshop-UE4SS mod dir.
+- `src/lib.rs` — Rust cdylib。内嵌 stock Lua 5.4（`mlua-sys` vendored），
+  与 UE4SS 内嵌解释器 ABI 一致。Axum（tokio）提供 WebSocket + `/health` +
+  根状态页。所有导出入口都经 `catch_unwind` 加固以支持热重载。
+- `lua/main.lua` — UE4SS Mod 脚本；`require('palws')` 后启动服务，实现
+  唯一的 `requestSnapshot` 同步状态机（F7 与网页刷新共用）。**此文件是
+  权威工作副本；游戏目录下的副本是部署产物。**
+- `examples/reload_harness.rs` — 热重载测试 harness。
+- `scripts/build.sh` — 编译并部署到 Workshop-UE4SS Mod 目录。
+- `scripts/package.ps1` — 打包发布产物（不含网页、不含构建脚本）。
 
-## Install (Workshop UE4SS Experimental)
+## 生产 v1 行为
 
-1. Subscribe to **UE4SS Experimental (Palworld)** on Steam Workshop, enable it
-   in 选项 → Mod 管理, launch once so the loader deploys it.
-2. `crates/palws/scripts/build.sh` deploys `palws.dll` + `main.lua` to
-   `Palworld\Mods\NativeMods\UE4SS\Mods\Palws\` and touches `enabled.txt`
-   (UE4SS's enabled.txt scan picks up the mod even if the loader regenerates
-   `mods.txt`). Run it from the workspace root (`scripts/build.sh`) or from
-   `crates/palws/`.
-3. On game start, UE4SS loads Palws; verify in
-   `Palworld\Mods\NativeMods\UE4SS\UE4SS.log`.
+- 不自动同步：不根据 UI、Widget、地图加载或对象创建触发任何请求。
+- 唯一入口 `requestSnapshot`：F7 键位与网页 `snapshot.request` 命令复用。
+- Lua 状态机每步重新获取 `PlayerState`，不跨定时器持有任何 UObject。
+- Lua → Rust 只走 `palws.broadcast(json)`，不经过文件系统。
+- Rust 缓存最后一份快照，新连接立即补发；消息带单调 `seq`，网页忽略旧序号。
+- WebSocket 只监听 `127.0.0.1`，不提供静态网页托管。
 
-Runtime payload (save-param dumps) is written to
-`C:\Users\xiaob\palworld-dump\palws-payload.json` — deliberately outside the
-game tree so loader migrations never break the path.
+## 安装（Workshop UE4SS Experimental）
 
-## Maintenance checklist (version-sensitive bits, by fragility)
+1. 在 Steam 创意工坊订阅并启用 **UE4SS Experimental (Palworld)**。
+2. 把发布压缩包中的 `Palws` 目录解压到
+   `Palworld\Mods\NativeMods\UE4SS\Mods\`。压缩包已含 `enabled.txt`，
+   无需改动 `mods.txt`、`mods.json` 或 `UE4SS-settings.ini`。
+3. 本地源码构建可用 `crates/palws/scripts/build.sh` 部署。
+4. 启动游戏后在 `Palworld\Mods\NativeMods\UE4SS\UE4SS.log` 确认
+   `[Palws] start_server: ok=true`。
 
-| Item | Location | Drift trigger | Fix |
-|---|---|---|---|
-| `SAVEPARAM_OFF` (struct offset) | `src/lib.rs` | every major game update | recalibrate with hexdump + level anchor (see below) |
-| `WBP_PalStorageMenu_C` class name | `lua/main.lua` | class rename | rename; F6 wide-capture catch-all finds it fast |
-| `FName::ToString` address | `lua/main.lua` | any | self-healing — re-read from UE4SS.log at each boot |
-| Lua 5.4 ABI (vendored) | `src/lib.rs` | loader swap | re-run spike (ping/version/echo) after changing UE4SS build |
-| `bUseUObjectArrayCache` ini tweak | manual-UE4SS only | — | do NOT carry over to Workshop UE4SS; it manages its own settings |
+## 协议
 
-### Recalibrating SAVEPARAM_OFF with hexdump
+WebSocket 端点 `ws://127.0.0.1:32123/ws`，所有消息为 JSON text frame，
+统一 envelope：
 
-The mod's built-in hexdump tool (F4 keybind) is the self-rescue tool for offset
-drift: dump the level anchor struct, diff against the known-good layout, and
-update `SAVEPARAM_OFF`. Keep it in the mod; it is gated behind keybinds and
-silent otherwise.
+```json
+{"protocol":"palws","version":1,"type":"snapshot","id":"...","request_id":"...",
+ "seq":42,"timestamp_ms":1786595000000,"payload":{...}}
+```
 
-## Release naming
+服务端 → 网页：`server.hello` / `sync.status` / `snapshot` / `log` / `error` / `pong`。
+网页 → 服务端：`client.hello` / `snapshot.request` / `ping`。
+入站上限 64 KiB；出站快照上限 8 MiB。
 
-`palws-<mod>.<game major>.<game minor>` (e.g. `palws-0.7.1-1.0`). Bump the mod
-component on behavior changes, keep the game component pinned to the Palworld
-version the offsets were calibrated against.
+## 发布命名
 
-## Manual-UE4SS install (legacy)
-
-Old layout: copy to `Pal\Binaries\Win64\ue4ss\Mods\Palws\` with `dwmapi.dll`
-proxy loader. **Do not run manual + Workshop UE4SS simultaneously** — a manual
-`dwmapi.dll` beside the Workshop loader crashes the game at startup.
+`palws-dev-YYYYMMDD-短SHA`（由 Windows CI 生成 prerelease）。

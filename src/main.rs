@@ -99,13 +99,19 @@ fn App() -> Element {
         open: planner_side_open,
     });
     // 游戏同步：状态 store + WebSocket 客户端（本地 mod 未启动时静默重试）
-    // 自动同步开关（key 沿用旧名 palcompanion_auto_merge 以保留用户已有状态）
-    let auto_sync = storage::use_persistent("palcompanion_auto_merge", || false);
     use_context_provider(|| sync_client::SyncStore {
         status: Signal::new(sync_client::SyncStatus::Disconnected),
-        pending: Signal::new(Vec::new()),
-        auto_sync,
-        toast: Signal::new(None),
+        phase_detail: Signal::new(None),
+        progress: Signal::new(None),
+        last_result: Signal::new(None),
+        logs: Signal::new(Vec::new()),
+        capabilities: Signal::new(Vec::new()),
+        clients: Signal::new(0),
+        missed: Signal::new(0),
+        send: Signal::new(None),
+        last_snapshot_seq: Signal::new(0),
+        request_seq: Signal::new(0),
+        show_detail: Signal::new(false),
     });
     sync_client::use_ws_sync();
     rsx! {
@@ -161,7 +167,7 @@ fn Navbar() -> Element {
                 }
             }
             footer { class: "attribution statusbar",
-                // 页脚改为状态栏：左侧同步状态 + 自动同步开关，右侧素材说明
+                // 页脚改为状态栏：左侧同步状态 + 刷新，右侧素材说明
                 sync_client::SyncStatusBar {}
                 span { class: "attribution-text",
                     "数据来自 "
@@ -169,7 +175,7 @@ fn Navbar() -> Element {
                     " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
                 }
             }
-            sync_client::SyncToast {}
+            sync_client::SyncConsole {}
         }
     }
 }
