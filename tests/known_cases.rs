@@ -111,6 +111,47 @@ fn pin_alternative_takes_effect_with_real_data() {
     }
 }
 
+/// 真实数据规模回归：接近完整图鉴的库存不应造成状态爆炸。
+#[test]
+fn planner_handles_full_roster() {
+    let db = load_db();
+    let owned: Vec<OwnedPal> = db
+        .pals
+        .iter()
+        .enumerate()
+        .map(|(i, pal)| OwnedPal {
+            id: i as u64 + 1,
+            species: pal.internal_name.clone(),
+            gender: if i % 2 == 0 {
+                Gender::Male
+            } else {
+                Gender::Female
+            },
+            passives: if i % 3 == 0 {
+                vec!["PAL_CorporateSlave".to_string()]
+            } else {
+                vec![]
+            },
+            group: PalGroup::Box,
+            is_boss: false,
+            favorite: 0,
+            nickname: None,
+            is_lucky: false,
+            basecamp: None,
+            synced: false,
+        })
+        .collect();
+    let target = &db.pals[db.pals.len() / 2].internal_name;
+    let plan = planner::plan(
+        &db,
+        &owned,
+        target,
+        &["PAL_CorporateSlave".to_string()],
+    )
+    .expect("完整库存应能规划目标");
+    assert!(!plan.used_owned.is_empty());
+}
+
 /// 真实数据复现用户场景：已持有沁莲龙♀（灵活/喜欢戏水），
 /// 规划鳍刀鱼路径时，沁莲龙节点必须是"已持有"而非"配种"。
 #[test]
