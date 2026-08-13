@@ -22,6 +22,9 @@ WebSocket 服务，供外部工具（pal-companion 等）显式同步游戏内�
 - Lua 状态机每步重新获取 `PlayerState`，不跨定时器持有任何 UObject。
 - Lua → Rust 只走 `palws.broadcast(json)`，不经过文件系统。
 - Rust 缓存最后一份快照，新连接立即补发；消息带单调 `seq`，网页忽略旧序号。
+- 快照是全量替换语义；网页会替换同步条目，同时保留 `synced=false` 的手工条目。
+- 网页刷新通过 Rust 有界命令队列交给 Lua 命令泵执行；Rust 网络线程不访问 Lua、UE 对象或游戏 RPC。
+- Lua reload 会建立新的 session：清空旧命令、重置同步状态和请求冷却，但保留服务端最后快照供重连客户端补发。
 - WebSocket 只监听 `127.0.0.1`，不提供静态网页托管。
 
 ## 安装（Workshop UE4SS Experimental）
@@ -32,7 +35,9 @@ WebSocket 服务，供外部工具（pal-companion 等）显式同步游戏内�
    无需改动 `mods.txt`、`mods.json` 或 `UE4SS-settings.ini`。
 3. 本地源码构建可用 `crates/palws/scripts/build.sh` 部署。
 4. 启动游戏后在 `Palworld\Mods\NativeMods\UE4SS\UE4SS.log` 确认
-   `[Palws] start_server: ok=true`。
+   `[Palws] require 'palws': ok=true`、`[Palws] start_server: ok=true` 和
+   `F7 = request snapshot`。如果绑定失败，日志会返回真实的
+   `bind failed on 127.0.0.1:32123`，而不是报告虚假的 started。
 
 ## 协议
 
@@ -46,7 +51,11 @@ WebSocket 端点 `ws://127.0.0.1:32123/ws`，所有消息为 JSON text frame，
 
 服务端 → 网页：`server.hello` / `sync.status` / `snapshot` / `log` / `error` / `pong`。
 网页 → 服务端：`client.hello` / `snapshot.request` / `ping`。
-入站上限 64 KiB；出站快照上限 8 MiB。
+所有 envelope 必须包含 `protocol: "palws"`、`version: 1` 和非空 `type`。
+入站 JSON message/frame 上限 64 KiB；出站快照上限 8 MiB。
+非法 JSON 或非法 envelope 会返回结构化 `error`，不会静默丢弃。
+
+HTTP `GET /health` 返回 `status`、`listening` 和 `clients`，可用于确认服务是否已经成功监听端口。
 
 ## 发布命名
 

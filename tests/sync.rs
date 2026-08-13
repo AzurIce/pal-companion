@@ -167,6 +167,28 @@ fn parse_protocol_mismatch() {
 }
 
 #[test]
+fn parse_missing_header_fields_rejected() {
+    // 缺失 version
+    let no_version = r#"{"protocol":"palws","type":"snapshot","payload":{"pals":[]}}"#;
+    assert_eq!(
+        sync::parse_server_message(no_version),
+        Err(SyncError::MissingField("version"))
+    );
+    // 缺失 type
+    let no_type = r#"{"protocol":"palws","version":1,"payload":{"pals":[]}}"#;
+    assert_eq!(
+        sync::parse_server_message(no_type),
+        Err(SyncError::MissingField("type"))
+    );
+    // 缺失 protocol
+    let no_protocol = r#"{"version":1,"type":"snapshot","payload":{"pals":[]}}"#;
+    assert_eq!(
+        sync::parse_server_message(no_protocol),
+        Err(SyncError::UnsupportedProtocol("".to_string()))
+    );
+}
+
+#[test]
 fn parse_invalid_json() {
     assert!(matches!(
         sync::parse_server_message("not json"),

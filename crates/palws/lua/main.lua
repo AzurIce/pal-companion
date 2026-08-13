@@ -47,6 +47,13 @@ end
 local okStart, startRes = pcall(palws.start_server, 32123)
 print("[Palws] start_server: ok=" .. tostring(okStart) .. " -> " .. tostring(startRes) .. "\n")
 
+-- Session boundary: after a UE4SS reload the Rust side may still hold a stale
+-- pending command from the previous Lua state. Drop it, reset sync state/cooldown,
+-- and keep the cached snapshot.
+if type(palws.begin_session) == "function" then
+    pcall(palws.begin_session)
+end
+
 -- ---------- helpers ----------
 local function isValid(obj)
     if obj == nil then return false end
@@ -496,6 +503,11 @@ local function dumpContainerPals(container, cidx)
     if n == nil then return {} end
     local group = "base"
     if n == 5 then group = "party" elseif n == 960 then group = "box" end
+    local basecamp = nil
+    if group == "base" then
+        baseCampSeq = baseCampSeq + 1
+        basecamp = baseCampSeq
+    end
     local pals = {}
     for i = 0, math.min(n, MAX_DUMP_PALS) - 1 do
         local okSlot, slot = pcall(function() return container:Get(i) end)
@@ -504,9 +516,8 @@ local function dumpContainerPals(container, cidx)
             local pj = buildPalJson(param, i, false)
             if pj then
                 pj = pj:sub(1, 1) .. '"container":' .. cidx .. ',"group":"' .. group .. '",' .. pj:sub(2)
-                if group == "base" then
-                    baseCampSeq = baseCampSeq + 1
-                    pj = pj:sub(1, 1) .. '"basecamp":' .. baseCampSeq .. ',' .. pj:sub(2)
+                if basecamp ~= nil then
+                    pj = pj:sub(1, 1) .. '"basecamp":' .. basecamp .. ',' .. pj:sub(2)
                 end
                 pals[#pals + 1] = pj
             end
@@ -716,6 +727,9 @@ local function commandPump()
             end
         end
     end
+    -- TODO: newer UE4SS exposes LoopInGameThreadWithDelay(delay, fn) which runs
+    -- directly on the game thread with a cancellable handle. Prefer it once its
+    -- availability/signature is verified against the installed Workshop build.
     ExecuteWithDelay(COMMAND_PUMP_INTERVAL_MS, commandPump)
 end
 ExecuteWithDelay(COMMAND_PUMP_INTERVAL_MS, commandPump)

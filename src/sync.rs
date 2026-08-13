@@ -184,6 +184,8 @@ pub enum SyncError {
     UnsupportedProtocol(String),
     /// 协议版本不匹配
     UnsupportedVersion(u32),
+    /// 缺少必需的 envelope 字段（protocol/version/type）
+    MissingField(&'static str),
 }
 
 impl std::fmt::Display for SyncError {
@@ -194,6 +196,7 @@ impl std::fmt::Display for SyncError {
             SyncError::UnsupportedVersion(v) => {
                 write!(f, "同步协议版本不支持：{v}（期望 {PROTOCOL_VERSION}）")
             }
+            SyncError::MissingField(field) => write!(f, "同步消息缺少字段：{field}"),
         }
     }
 }
@@ -235,7 +238,7 @@ fn parse_stats(payload: &serde_json::Value) -> SnapshotStats {
     }
 }
 
-/// 解析一条服务端消息；协议/版本不匹配返回 SyncError（调用方打日志后忽略）。
+/// 解析一条服务端消息；协议/版本/type 缺失或不匹配返回 SyncError（调用方打日志后忽略）。
 pub fn parse_server_message(text: &str) -> Result<ServerEvent, SyncError> {
     let env: Envelope =
         serde_json::from_str(text).map_err(|e| SyncError::Parse(e.to_string()))?;
@@ -244,10 +247,14 @@ pub fn parse_server_message(text: &str) -> Result<ServerEvent, SyncError> {
             env.protocol.unwrap_or_default(),
         ));
     }
-    if let Some(v) = env.version {
-        if v != PROTOCOL_VERSION {
-            return Err(SyncError::UnsupportedVersion(v));
-        }
+    let Some(version) = env.version else {
+        return Err(SyncError::MissingField("version"));
+    };
+    if version != PROTOCOL_VERSION {
+        return Err(SyncError::UnsupportedVersion(version));
+    }
+    if env.mtype.is_empty() {
+        return Err(SyncError::MissingField("type"));
     }
     let payload = env.payload.unwrap_or(serde_json::Value::Null);
     let ev = match env.mtype.as_str() {

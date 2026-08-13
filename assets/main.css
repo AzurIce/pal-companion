@@ -1212,32 +1212,33 @@ footer.attribution a { color: inherit; text-decoration: underline; }
 .sync-result--ok { background: hsl(142 71% 45% / .12); color: hsl(142 71% 30%); }
 .sync-result--err { background: hsl(0 72% 51% / .12); color: hsl(0 72% 40%); }
 
-/* 右下角日志面板 + 悬浮按钮 */
-.sync-console-fab {
-    position: fixed;
-    right: 16px;
-    bottom: 16px;
-    z-index: 200;
-    width: 40px;
-    height: 40px;
-    padding: 0;
+/* footer 右侧：日志按钮 + 素材说明 */
+.statusbar-right {
     display: flex;
     align-items: center;
-    justify-content: center;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--card);
-    color: var(--foreground);
-    cursor: pointer;
-    box-shadow: 0 4px 16px rgba(0,0,0,.18);
+    gap: 12px;
+    min-width: 0;
 }
 
-.sync-console-fab:hover { border-color: var(--primary, hsl(217 91% 60%)); }
+.sync-log-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius, 6px);
+    background: transparent;
+    color: var(--muted-foreground);
+    font-size: 12px;
+    cursor: pointer;
+    position: relative;
+}
 
-.sync-console-badge {
-    position: absolute;
-    top: -4px;
-    right: -4px;
+.sync-log-btn:hover { color: var(--foreground); border-color: var(--primary, hsl(217 91% 60%)); }
+
+.sync-log-btn--active { color: var(--foreground); border-color: var(--primary, hsl(217 91% 60%)); }
+
+.sync-log-btn-badge {
     min-width: 16px;
     height: 16px;
     padding: 0 4px;
@@ -1249,16 +1250,12 @@ footer.attribution a { color: inherit; text-decoration: underline; }
     text-align: center;
 }
 
+/* 展开在 footer 下方的日志面板 */
 .sync-console {
-    position: fixed;
-    right: 16px;
-    bottom: 66px;
-    z-index: 200;
-    width: min(360px, calc(100vw - 32px));
+    margin: 0 24px 12px;
     border: 1px solid var(--border);
     border-radius: var(--radius, 10px);
     background: var(--card);
-    box-shadow: 0 8px 32px rgba(0,0,0,.24);
     padding: 10px 12px;
     font-size: 12px;
 }
@@ -1343,9 +1340,25 @@ footer.statusbar { display: flex; align-items: center; justify-content: space-be
     transform: translateX(14px);
 }
 .sync-switch input:focus-visible + .sync-switch-track { outline: 2px solid var(--border); outline-offset: 2px; }
-/* 据点子 tab（base 分组下的二级 tab） */
-.sidebar-sort--sub { margin-top: 6px; }
-.sidebar-sort--sub .segmented { flex-wrap: wrap; gap: 4px; }
-.sidebar-sort--sub .segmented button { font-size: 11.5px; padding: 3px 8px; }
+/* 据点子 tab（base 分组下的二级 tab）：据点多时保持单行横向滚动。 */
+.sidebar-sort--sub {
+    max-width: 100%;
+    margin-top: 6px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: thin;
+}
+.sidebar-sort--sub .segmented {
+    width: max-content;
+    min-width: 100%;
+    flex-wrap: nowrap;
+    gap: 4px;
+}
+.sidebar-sort--sub .segmented button {
+    flex: 0 0 auto;
+    white-space: nowrap;
+    font-size: 11.5px;
+    padding: 3px 8px;
+}
 .sync-toast { position: fixed; right: 24px; bottom: 48px; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius, 8px); padding: 10px 16px; box-shadow: 0 4px 16px rgba(0,0,0,.18); z-index: 100; font-size: 13px; }
 .lucky-tag { font-size: 11px; color: #a16207; background: #fef9c3; border-radius: var(--radius, 4px); padding: 0 4px; margin-left: 4px; }

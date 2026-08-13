@@ -431,16 +431,52 @@ pub fn SyncStatusBar() -> Element {
     }
 }
 
-/// 右下角日志入口：一个悬浮按钮，点击展开/收起可滚动的日志面板。
+/// footer 里的日志开关按钮（带事件数徽标）。
 #[component]
-pub fn SyncConsole() -> Element {
+pub fn SyncLogButton() -> Element {
     let sync = use_context::<SyncStore>();
-    let show = *sync.show_detail.read();
-    let mut show_detail = sync.show_detail;
+    let mut show = sync.show_detail;
+    let count = sync.logs.read().len();
+    let active = *sync.show_detail.read();
+
+    rsx! {
+        button {
+            class: if active { "sync-log-btn sync-log-btn--active" } else { "sync-log-btn" },
+            title: "同步日志",
+            onclick: move |_| {
+                let next = !*show.peek();
+                show.set(next);
+            },
+            svg {
+                width: "14",
+                height: "14",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                polyline { points: "4 17 10 11 4 5" }
+                line { x1: "12", y1: "19", x2: "20", y2: "19" }
+            }
+            "日志"
+            if count > 0 {
+                span { class: "sync-log-btn-badge", "{count}" }
+            }
+        }
+    }
+}
+
+/// 日志面板：展开在 footer 下方，可滚动、可选中、可复制。
+#[component]
+pub fn SyncLogPanel() -> Element {
+    let sync = use_context::<SyncStore>();
+    if !*sync.show_detail.read() {
+        return rsx! {};
+    }
     let logs = sync.logs.read();
     let result = sync.last_result.read().clone();
     let mut copied = use_signal(|| false);
-    let count = logs.len();
 
     let diagnostic = {
         let mut s = String::from("pal-companion sync diagnostics\n");
@@ -466,54 +502,29 @@ pub fn SyncConsole() -> Element {
     };
 
     rsx! {
-        if show {
-            div { class: "sync-console",
-                div { class: "sync-console-head",
-                    span { class: "sync-console-title", "同步日志" }
-                    Button {
-                        variant: BtnVariant::Ghost,
-                        sm: true,
-                        onclick: copy,
-                        if *copied.read() { "已复制" } else { "复制" }
-                    }
-                }
-                if let Some(r) = &result {
-                    div {
-                        class: if r.ok { "sync-result sync-result--ok" } else { "sync-result sync-result--err" },
-                        "{r.text}（{r.at}）"
-                    }
-                }
-                div { class: "sync-console-log",
-                    if logs.is_empty() {
-                        div { class: "sync-console-empty", "暂无事件" }
-                    }
-                    for l in logs.iter().rev() {
-                        div { class: "sync-console-entry sync-console-entry--{l.level}", "{l.message}" }
-                    }
+        div { class: "sync-console",
+            div { class: "sync-console-head",
+                span { class: "sync-console-title", "同步日志" }
+                Button {
+                    variant: BtnVariant::Ghost,
+                    sm: true,
+                    onclick: copy,
+                    if *copied.read() { "已复制" } else { "复制" }
                 }
             }
-        }
-        button {
-            class: "sync-console-fab",
-            title: "同步日志",
-            onclick: move |_| {
-                let next = !*show_detail.peek();
-                show_detail.set(next);
-            },
-            svg {
-                width: "16",
-                height: "16",
-                view_box: "0 0 24 24",
-                fill: "none",
-                stroke: "currentColor",
-                stroke_width: "2",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-                polyline { points: "4 17 10 11 4 5" }
-                line { x1: "12", y1: "19", x2: "20", y2: "19" }
+            if let Some(r) = &result {
+                div {
+                    class: if r.ok { "sync-result sync-result--ok" } else { "sync-result sync-result--err" },
+                    "{r.text}（{r.at}）"
+                }
             }
-            if count > 0 {
-                span { class: "sync-console-badge", "{count}" }
+            div { class: "sync-console-log",
+                if logs.is_empty() {
+                    div { class: "sync-console-empty", "暂无事件" }
+                }
+                for l in logs.iter().rev() {
+                    div { class: "sync-console-entry sync-console-entry--{l.level}", "{l.message}" }
+                }
             }
         }
     }

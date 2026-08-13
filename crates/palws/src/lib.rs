@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use std::ffi::{c_char, c_int};
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,8 @@ const PROTOCOL_NAME: &str = "palws";
 const PROTOCOL_VERSION: u64 = 1;
 /// Outbound snapshot upper bound (initial suggestion from the plan).
 const MAX_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+/// Inbound WebSocket message/frame upper bound (matches the protocol contract).
+const MAX_INBOUND_BYTES: usize = 64 * 1024;
 /// Bounded command queue capacity.
 const CMD_QUEUE_CAP: usize = 16;
 /// Minimum interval between two accepted `snapshot.request` commands.
@@ -86,6 +88,8 @@ struct AppState {
     sync_state: RwLock<String>,
     /// Last accepted `snapshot.request` time (cooldown).
     last_request: Mutex<Instant>,
+    /// True once the HTTP/WS listener has successfully bound.
+    listening: AtomicBool,
 }
 
 impl AppState {
@@ -99,6 +103,7 @@ impl AppState {
             event_seq: AtomicU64::new(0),
             sync_state: RwLock::new("idle".to_string()),
             last_request: Mutex::new(Instant::now() - SNAPSHOT_COOLDOWN),
+            listening: AtomicBool::new(false),
         })
     }
 }
@@ -159,7 +164,9 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl axum::response::IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+    ws.max_message_size(MAX_INBOUND_BYTES)
+        .max_frame_size(MAX_INBOUND_BYTES)
+        .on_upgrade(move |socket| handle_ws(socket, state))
 }
 
 fn build_hello(state: &AppState) -> String {
@@ -207,12 +214,39 @@ fn enqueue_snapshot_request(state: &AppState, id: &str) -> Result<(), &'static s
 /// Handle one inbound text frame. Returns an optional direct reply to this client
 /// (error / pong). Accepted commands are queued and produce no direct reply.
 fn handle_client_message(state: &AppState, text: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let obj = v.as_object()?;
+    let v: serde_json::Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(_) => {
+            return Some(error_event(
+                state,
+                None,
+                "invalid_json",
+                "消息不是合法 JSON",
+                false,
+            ));
+        }
+    };
+    let Some(obj) = v.as_object() else {
+        return Some(error_event(
+            state,
+            None,
+            "invalid_envelope",
+            "envelope 必须是 JSON 对象",
+            false,
+        ));
+    };
 
     let protocol = obj.get("protocol").and_then(|p| p.as_str());
     let version = obj.get("version").and_then(|v| v.as_u64());
-    let mtype = obj.get("type").and_then(|t| t.as_str())?;
+    let Some(mtype) = obj.get("type").and_then(|t| t.as_str()) else {
+        return Some(error_event(
+            state,
+            None,
+            "invalid_envelope",
+            "缺少 type 字段",
+            false,
+        ));
+    };
 
     if protocol != Some(PROTOCOL_NAME) {
         return Some(error_event(
@@ -326,8 +360,10 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let listening = state.listening.load(Ordering::SeqCst);
     Json(serde_json::json!({
-        "status": "ok",
+        "status": if listening { "ok" } else { "starting" },
+        "listening": listening,
         "clients": state.clients.load(Ordering::SeqCst),
     }))
 }
@@ -336,21 +372,15 @@ async fn root_page() -> Html<&'static str> {
     Html(ROOT_PAGE)
 }
 
-async fn run_server(port: u16, state: Arc<AppState>) {
+/// Serve on an already-bound listener. Binding happens synchronously in
+/// `start_server_impl` so Lua gets the real bind result instead of a fake
+/// "started" message.
+async fn run_server(listener: tokio::net::TcpListener, state: Arc<AppState>) {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/health", get(health))
         .fallback(get(root_page))
         .with_state(state);
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = match tokio::net::TcpListener::bind(addr).await {
-        Ok(l) => l,
-        Err(_e) => {
-            // e.g. hot reload while an old server still owns the port: ignore, don't die
-            return;
-        }
-    };
     let _ = axum::serve(listener, app).await;
 }
 
@@ -364,17 +394,32 @@ unsafe fn start_server_impl(l: *mut lua_State) -> c_int {
         return 1;
     }
     let port = luaL_optinteger(l, 1, DEFAULT_PORT);
-    match Runtime::new() {
-        Ok(rt) => {
-            let state = STATE.get().cloned().unwrap_or_else(AppState::new);
-            let _ = STATE.set(state.clone());
-            rt.spawn(async move { run_server(port as u16, state).await });
+    let rt = match Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            push_lstring(l, &format!("runtime create failed: {e}"));
+            return 1;
+        }
+    };
+
+    let state = STATE.get().cloned().unwrap_or_else(AppState::new);
+    let _ = STATE.set(state.clone());
+
+    // Bind synchronously so we can report the real result (port conflict etc.)
+    // to Lua instead of pretending the server started.
+    let addr = SocketAddr::from(([127, 0, 0, 1], port as u16));
+    match rt.block_on(tokio::net::TcpListener::bind(addr)) {
+        Ok(listener) => {
+            state.listening.store(true, Ordering::SeqCst);
+            rt.spawn(async move { run_server(listener, state).await });
             if RT.set(rt).is_err() {
                 // reload race: another runtime already owns the server; drop this one
             }
             push_lstring(l, &format!("started on 127.0.0.1:{port}"));
         }
-        Err(e) => push_lstring(l, &format!("runtime create failed: {e}")),
+        Err(e) => {
+            push_lstring(l, &format!("bind failed on 127.0.0.1:{port}: {e}"));
+        }
     }
     1
 }
@@ -482,6 +527,38 @@ unsafe fn take_command_impl(l: *mut lua_State) -> c_int {
     1
 }
 
+/// Reset the per-Lua-session state after a UE4SS reload. Keeps `latest_snapshot`
+/// (so new clients still get a replay) but drops any stale pending commands,
+/// clears the cooldown, and marks the sync state idle. Broadcasts a fresh
+/// `sync.status` so already-connected clients see the boundary.
+unsafe fn begin_session_impl(l: *mut lua_State) -> c_int {
+    if let Some(state) = STATE.get() {
+        state
+            .command_queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *state
+            .sync_state
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = "idle".to_string();
+        *state
+            .last_request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Instant::now() - SNAPSHOT_COOLDOWN;
+
+        let ev = make_event(
+            state,
+            "sync.status",
+            None,
+            serde_json::json!({ "phase": "idle", "requested_pages": 0, "total_pages": 0, "trigger": "reload" }),
+        );
+        let _ = state.outbound.send(Arc::from(ev));
+    }
+    lua_pushboolean(l, 1);
+    1
+}
+
 unsafe fn client_count_impl(l: *mut lua_State) -> c_int {
     let n = STATE
         .get()
@@ -544,6 +621,7 @@ macro_rules! export_fn {
 export_fn!(start_server, "start_server", start_server_impl);
 export_fn!(broadcast_lua, "broadcast", broadcast_impl);
 export_fn!(take_command_lua, "take_command", take_command_impl);
+export_fn!(begin_session, "begin_session", begin_session_impl);
 export_fn!(client_count, "client_count", client_count_impl);
 export_fn!(version, "version", version_impl);
 
@@ -553,6 +631,7 @@ unsafe fn luaopen_impl(l: *mut lua_State) -> c_int {
         ("start_server", start_server),
         ("broadcast", broadcast_lua),
         ("take_command", take_command_lua),
+        ("begin_session", begin_session),
         ("client_count", client_count),
         ("version", version),
     ];

@@ -35,6 +35,7 @@ print("[{tag}] client_count:", m.client_count())
 print("[{tag}] broadcast valid:", m.broadcast([=[{{"protocol":"palws","version":1,"type":"log","id":"lua-1","payload":{{"level":"info","source":"lua","message":"hi"}}}}]=]))
 print("[{tag}] broadcast invalid:", m.broadcast("not json"))
 print("[{tag}] take_command (empty):", tostring(m.take_command()))
+print("[{tag}] begin_session:", m.begin_session())
 print("[{tag}] start_server #2:", m.start_server(32123))
 "#,
         tag = tag,

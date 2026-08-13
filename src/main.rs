@@ -167,15 +167,18 @@ fn Navbar() -> Element {
                 }
             }
             footer { class: "attribution statusbar",
-                // 页脚改为状态栏：左侧同步状态 + 刷新，右侧素材说明
+                // 页脚状态栏：左侧同步状态 + 刷新，右侧日志按钮 + 素材说明
                 sync_client::SyncStatusBar {}
-                span { class: "attribution-text",
-                    "数据来自 "
-                    a { href: "https://github.com/tylercamp/palcalc", "palcalc" }
-                    " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
+                div { class: "statusbar-right",
+                    span { class: "attribution-text",
+                        "数据来自 "
+                        a { href: "https://github.com/tylercamp/palcalc", "palcalc" }
+                        " (MIT)，配种规则经游戏数据穷举表 100% 回归校验。帕鲁名称与图像素材 © Pocketpair。"
+                    }
+                    sync_client::SyncLogButton {}
                 }
             }
-            sync_client::SyncConsole {}
+            sync_client::SyncLogPanel {}
         }
     }
 }
