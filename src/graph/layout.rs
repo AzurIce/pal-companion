@@ -26,7 +26,7 @@ pub struct GraphData {
     pub info: HashMap<String, PlanNode>,
     /// 根（目标）节点 id
     pub root_id: String,
-    /// 实际需要执行的配种次数（折叠后）
+    /// 实际需要执行的配种次数（按原始配种树计；图形折叠不代表少做一次配种）
     pub bred_count: usize,
     /// 实际用到的已持有帕鲁 id
     pub used_owned: Vec<u64>,
@@ -242,11 +242,7 @@ pub fn layout_plan(root: &PlanNode) -> GraphData {
         .enumerate()
         .map(|(id, pn)| (format!("n{id}"), pn.clone()))
         .collect();
-    let bred_count = dag
-        .nodes
-        .iter()
-        .filter(|pn| matches!(pn.source, PlanSource::Bred { .. }))
-        .count();
+    let bred_count = count_breedings(root);
     let mut used_owned: Vec<u64> = dag
         .nodes
         .iter()
@@ -265,6 +261,13 @@ pub fn layout_plan(root: &PlanNode) -> GraphData {
         root_id: format!("n{}", dag.root),
         bred_count,
         used_owned,
+    }
+}
+
+fn count_breedings(node: &PlanNode) -> usize {
+    match &node.source {
+        PlanSource::Owned { .. } => 0,
+        PlanSource::Bred { p1, p2, .. } => 1 + count_breedings(p1) + count_breedings(p2),
     }
 }
 
@@ -327,8 +330,8 @@ mod tests {
             .unwrap();
         let out = g.edges.iter().filter(|e| e.source.0 == c_id).count();
         assert_eq!(out, 2);
-        // 折叠后配种次数：C、F、G 共 3 次
-        assert_eq!(g.bred_count, 3);
+        // 图中 C 被折叠，但实际仍需分别生产两次：C、C、F、G 共 4 次。
+        assert_eq!(g.bred_count, 4);
     }
 
     #[test]

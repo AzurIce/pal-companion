@@ -1,17 +1,14 @@
 //! 配种路径规划：从已持有帕鲁出发，计算得到目标帕鲁的最优配种树。
 //!
-//! 算法：超图上的 Dijkstra。每个物种最多有两个"获得方式"条目：
-//! - 已持有条目（cost 0，性别按登记合并，tie-break 分数来自已持有被动）；
-//! - 配种条目（cost = 双亲 cost + 1，性别雌雄均可——后代性别假设，UI 会注明）。
-//!
-//! 按 (cost 升序, depth 升序, passive_score 降序) 逐个 finalize；
-//! 每 finalize 一个条目，与所有已 finalize 条目尝试配对提议子代。
-//! 由于子代 cost 严格大于双亲，该顺序对 cost 是精确最优；
-//! depth 与 passive_score 仅作平局偏好。
+//! 全部已持有个体以具体 ID、性别和被动池作为独立初始状态；同一物种保留
+//! 互不支配的多条获取状态。新状态通过增量工作队列传播，详见 planner/solver.rs。
 
-use crate::breeding::{BreedOutcome, BreedingDB};
+use crate::breeding::BreedingDB;
 use serde::{Deserialize, Serialize};
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::HashMap;
+
+#[path = "planner/solver.rs"]
+mod solver;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Gender {
@@ -144,6 +141,13 @@ pub enum PlanError {
         unique_parents: Vec<(String, String)>,
     },
 }
+
+// 旧单状态核心不再参与编译，仅暂留作迁移对照，后续可从版本历史查看。
+#[cfg(any())]
+mod legacy_single_state {
+use super::*;
+use crate::breeding::BreedOutcome;
+use std::collections::{BinaryHeap, HashSet};
 
 /// 一个物种的一种获得方式。
 #[derive(Debug, Clone)]
@@ -616,7 +620,7 @@ impl<'a> Planner<'a> {
     }
 }
 
-fn collect_stats(root: &PlanNode, breedings: &mut u32, used: &mut Vec<u64>) -> u32 {
+fn legacy_collect_stats(root: &PlanNode, breedings: &mut u32, used: &mut Vec<u64>) -> u32 {
     match &root.source {
         PlanSource::Owned { pal_id } => {
             used.push(*pal_id);
@@ -624,8 +628,8 @@ fn collect_stats(root: &PlanNode, breedings: &mut u32, used: &mut Vec<u64>) -> u
         }
         PlanSource::Bred { p1, p2, .. } => {
             *breedings += 1;
-            let d1 = collect_stats(p1, breedings, used);
-            let d2 = collect_stats(p2, breedings, used);
+            let d1 = legacy_collect_stats(p1, breedings, used);
+            let d2 = legacy_collect_stats(p2, breedings, used);
             d1.max(d2) + 1
         }
     }
@@ -767,7 +771,7 @@ impl Planner<'_> {
         let root = self.build_node(root_ref, None, &mut Vec::new());
         let mut breedings = 0;
         let mut used = Vec::new();
-        let generations = collect_stats(&root, &mut breedings, &mut used);
+        let generations = legacy_collect_stats(&root, &mut breedings, &mut used);
         used.sort_unstable();
         used.dedup();
         Plan {
@@ -795,8 +799,24 @@ impl Planner<'_> {
         }
     }
 }
+}
 
-/// 计算从已持有帕鲁到目标物种的最优配种路径（无钉选）。
+fn collect_stats(root: &PlanNode, breedings: &mut u32, used: &mut Vec<u64>) -> u32 {
+    match &root.source {
+        PlanSource::Owned { pal_id } => {
+            used.push(*pal_id);
+            0
+        }
+        PlanSource::Bred { p1, p2, .. } => {
+            *breedings += 1;
+            let d1 = collect_stats(p1, breedings, used);
+            let d2 = collect_stats(p2, breedings, used);
+            d1.max(d2) + 1
+        }
+    }
+}
+
+/// 计算从全部已持有个体到目标物种的最优配种路径（无钉选）。
 #[allow(dead_code)] // 测试使用；生产代码走 plan_with_pins
 pub fn plan(
     db: &BreedingDB,
@@ -809,12 +829,10 @@ pub fn plan(
 
 /// 带钉选亲本对（物种 → 无序亲本对）的规划。
 ///
-/// 被动语义：已持有目标但单只未覆盖全部期望被动时视为"未达成"，
-/// 转而求配种路径。两级求解：先求"最少配种次数"的路径，若其血统能覆盖
-/// 全部期望被动则直接采用；否则再求"覆盖优先"的路径（可接受更多次数），
-/// 两者取覆盖更好者（平局取次数少者）。覆盖优先为启发式，非严格最优。
-/// 钉选在树重建阶段局部生效：仅替换被钉选节点的亲本对，不影响搜索与其余结构；
-/// 不可行或成环的钉选自动忽略。
+/// 每只已持有帕鲁以具体 ID、性别和被动池作为独立状态；同一物种保留
+/// 互不支配的多条获取路线。结果依次优先完整覆盖、覆盖更多、被动池更干净、
+/// 配种次数更少、世代更浅。钉选约束对应物种节点的直接亲本；无有效钉选路线
+/// 时自动回退到最优可行路线。
 pub fn plan_with_pins(
     db: &BreedingDB,
     owned: &[OwnedPal],
@@ -822,9 +840,12 @@ pub fn plan_with_pins(
     desired_passives: &[String],
     pins: &HashMap<String, (String, String)>,
 ) -> Result<Plan, PlanError> {
-    plan_inner(db, owned, target, desired_passives, pins)
+    solver::solve(db, owned, target, desired_passives, pins)
 }
 
+#[cfg(any())]
+mod legacy_plan_selection {
+use super::*;
 fn plan_inner(
     db: &BreedingDB,
     owned: &[OwnedPal],
@@ -1077,11 +1098,12 @@ fn build_same_chain(
         alternatives,
     }
 }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::breeding::{Pal, UniqueCombo};
+    use crate::breeding::{BreedOutcome, Pal, UniqueCombo};
 
     fn pal(name: &str, power: i64, index: i64, breedable: bool) -> Pal {
         Pal {
@@ -1109,6 +1131,45 @@ mod tests {
             is_lucky: false,
             basecamp: None,
             synced: false,
+        }
+    }
+
+    fn assert_executable_plan(db: &BreedingDB, owned: &[OwnedPal], node: &PlanNode) {
+        match &node.source {
+            PlanSource::Owned { pal_id } => {
+                let pal = owned
+                    .iter()
+                    .find(|pal| pal.id == *pal_id)
+                    .expect("路径引用的库存 ID 必须存在");
+                assert_eq!(pal.species, node.species);
+                if let Some(gender) = node.need_gender {
+                    assert_eq!(pal.gender, gender);
+                }
+            }
+            PlanSource::Bred { p1, p2, .. } => {
+                assert_executable_plan(db, owned, p1);
+                assert_executable_plan(db, owned, p2);
+                let p1_gender = p1.need_gender.expect("配种亲本必须有性别要求");
+                let p2_gender = p2.need_gender.expect("配种亲本必须有性别要求");
+                assert_ne!(p1_gender, p2_gender);
+                let outcome = db
+                    .breed(&p1.species, &p2.species)
+                    .expect("路径亲本必须可配种");
+                let actual = match outcome {
+                    BreedOutcome::Normal(child) => child,
+                    BreedOutcome::GenderDependent {
+                        if_p1_female,
+                        if_p2_female,
+                    } => {
+                        if p1_gender == Gender::Female {
+                            if_p1_female
+                        } else {
+                            if_p2_female
+                        }
+                    }
+                };
+                assert_eq!(db.pals[actual].internal_name, node.species);
+            }
         }
     }
 
@@ -1355,7 +1416,11 @@ mod tests {
     #[test]
     fn owned_target_with_all_desired_is_trivial() {
         let db = sample_db();
-        let owned = vec![owned(3, "C", Gender::Female, &["lucky", "brave"])];
+        let owned = vec![
+            owned(1, "A", Gender::Male, &[]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "C", Gender::Female, &["lucky", "brave"]),
+        ];
         let plan = plan(
             &db,
             &owned,
@@ -1363,6 +1428,35 @@ mod tests {
             &["lucky".to_string(), "brave".to_string()],
         )
         .unwrap();
+        assert_eq!(plan.total_breedings, 0);
+        assert_eq!(plan.used_owned, vec![3]);
+    }
+
+    /// 钉选物种没有出现在最终路径时，不得被误认为已经满足；
+    /// 因而应整体回退到正常最优路径。
+    #[test]
+    fn absent_pin_falls_back_without_marking_it_satisfied() {
+        let db = sample_db();
+        let owned = vec![
+            owned(1, "A", Gender::Male, &[]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "D", Gender::Female, &[]),
+        ];
+        let mut pins = HashMap::new();
+        pins.insert("D".to_string(), ("A".to_string(), "B".to_string()));
+        let plan = plan_with_pins(&db, &owned, "C", &[], &pins).unwrap();
+        assert_eq!(plan.total_breedings, 1);
+        assert_eq!(plan.used_owned, vec![1, 2]);
+    }
+
+    /// 钉选不可满足时，回退候选也必须包含已经满足目标的库存个体。
+    #[test]
+    fn impossible_pin_falls_back_to_owned_target() {
+        let db = sample_db();
+        let owned = vec![owned(3, "C", Gender::Female, &["lucky"])];
+        let mut pins = HashMap::new();
+        pins.insert("C".to_string(), ("A".to_string(), "B".to_string()));
+        let plan = plan_with_pins(&db, &owned, "C", &["lucky".to_string()], &pins).unwrap();
         assert_eq!(plan.total_breedings, 0);
         assert_eq!(plan.used_owned, vec![3]);
     }
@@ -1481,6 +1575,53 @@ mod tests {
         assert_eq!(plan.total_breedings, 1);
     }
 
+    /// 多个钉选必须作为整棵路径的约束共同满足，而不是只应用目标节点。
+    #[test]
+    fn pins_on_target_and_intermediate_are_both_respected() {
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 110, 2, false),
+                pal("C", 200, 3, false),
+                pal("M", 150, 4, false),
+                pal("T", 250, 5, false),
+            ],
+            vec![
+                UniqueCombo {
+                    parent1: "A".into(),
+                    parent2: "B".into(),
+                    child: "M".into(),
+                    female_parent: None,
+                },
+                UniqueCombo {
+                    parent1: "C".into(),
+                    parent2: "M".into(),
+                    child: "T".into(),
+                    female_parent: None,
+                },
+            ],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Male, &[]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "C", Gender::Female, &[]),
+        ];
+        let mut pins = HashMap::new();
+        pins.insert("M".to_string(), ("A".to_string(), "B".to_string()));
+        pins.insert("T".to_string(), ("C".to_string(), "M".to_string()));
+        let plan = plan_with_pins(&db, &owned, "T", &[], &pins).unwrap();
+        let PlanSource::Bred { p1, p2, .. } = &plan.root.source else {
+            panic!("目标应为配种节点");
+        };
+        let m = if p1.species == "M" { p1 } else { p2 };
+        let PlanSource::Bred { p1, p2, .. } = &m.source else {
+            panic!("中间物种应按钉选配出");
+        };
+        let mut parents = [p1.species.as_str(), p2.species.as_str()];
+        parents.sort();
+        assert_eq!(parents, ["A", "B"]);
+    }
+
     /// 同种合并链：三只各带一个期望被动的同种 → 两次自配收满。
     #[test]
     fn same_species_chain_merges_three_pals() {
@@ -1500,12 +1641,70 @@ mod tests {
         assert_eq!(plan.total_breedings, 2);
         assert_eq!(plan.generations, 2);
         assert_eq!(plan.used_owned, vec![1, 2, 3]);
-        // 链末端（根的亲本一）应为配种节点
+        // 链末端的两个亲本之一应为前一步配种节点；左右顺序不作保证。
         let PlanSource::Bred { p1, p2, .. } = &plan.root.source else {
             panic!();
         };
-        assert!(matches!(p1.source, PlanSource::Bred { .. }));
-        assert!(matches!(p2.source, PlanSource::Owned { .. }));
+        assert!(
+            matches!(p1.source, PlanSource::Bred { .. })
+                || matches!(p2.source, PlanSource::Bred { .. })
+        );
+        assert!(
+            matches!(p1.source, PlanSource::Owned { .. })
+                || matches!(p2.source, PlanSource::Owned { .. })
+        );
+    }
+
+    /// 即使两只同种个体的性别和被动完全相同，也不能按状态去重；
+    /// 自种配种必须保留两个不同的库存 ID。
+    #[test]
+    fn identical_same_species_individuals_remain_distinct() {
+        let db = BreedingDB::new(vec![pal("X", 150, 1, true)], vec![]);
+        let owned = vec![
+            owned(1, "X", Gender::Male, &[]),
+            owned(2, "X", Gender::Female, &[]),
+        ];
+        let mut pins = HashMap::new();
+        pins.insert("X".to_string(), ("X".to_string(), "X".to_string()));
+        let plan = plan_with_pins(&db, &owned, "X", &[], &pins).unwrap();
+        assert_eq!(plan.total_breedings, 1);
+        assert_eq!(plan.used_owned, vec![1, 2]);
+        let PlanSource::Bred { p1, p2, .. } = &plan.root.source else {
+            panic!("目标应由两只不同的同种个体配出");
+        };
+        let mut ids = Vec::new();
+        for node in [p1, p2] {
+            let PlanSource::Owned { pal_id } = node.source else {
+                panic!("同种配种的亲本应为库存个体");
+            };
+            ids.push(pal_id);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// 被动池不是协议边界；同步数据带来 128 种以上词条时，规划仍必须稳定。
+    #[test]
+    fn passive_pool_supports_more_than_128_distinct_entries() {
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 200, 2, false),
+                pal("T", 150, 3, true),
+            ],
+            vec![],
+        );
+        let passives: Vec<String> = (0..129).map(|i| format!("passive-{i}")).collect();
+        let owned = vec![
+            OwnedPal {
+                passives,
+                ..owned(1, "A", Gender::Male, &[])
+            },
+            owned(2, "B", Gender::Female, &[]),
+        ];
+        let plan = plan(&db, &owned, "T", &["passive-0".to_string()]).unwrap();
+        assert_eq!(plan.total_breedings, 1);
+        assert_eq!(plan.used_owned, vec![1, 2]);
     }
 
     /// 池感知：覆盖相同时，优先选择垃圾词条更少（继承池更干净）的亲本路径。
@@ -1532,5 +1731,119 @@ mod tests {
         let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
         assert!(plan.used_owned.contains(&1));
         assert!(!plan.used_owned.contains(&3));
+    }
+
+    /// 回归：搜索阶段选择的被动必须属于最终性别实际采用的同物种个体。
+    #[test]
+    fn passive_coverage_is_bound_to_the_actual_gendered_individual() {
+        // A 有两只：带 lucky 的雌性和不带被动的雄性；B 只有雌性。
+        // A×B 时 A 必须为雄性；求解器可先 A♀×A♂ 合并被动，再取得雄性后代。
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 200, 2, false),
+                pal("T", 150, 3, true),
+            ],
+            vec![],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Female, &["lucky"]),
+            owned(2, "A", Gender::Male, &[]),
+            owned(3, "B", Gender::Female, &[]),
+        ];
+        let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
+        assert_executable_plan(&db, &owned, &plan.root);
+        assert_eq!(plan.used_owned, vec![1, 2, 3]);
+        assert_eq!(plan.total_breedings, 2);
+        assert!(plan.used_owned.contains(&1), "目标被动必须来自最终路径中的具体个体");
+    }
+
+    /// 回归：同物种全部个体都应参与候选，不能因覆盖数量相同而只保留输入中的一个。
+    #[test]
+    fn all_owned_individuals_of_a_species_are_considered() {
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 200, 2, false),
+                pal("T", 150, 3, true),
+            ],
+            vec![],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Male, &["lucky", "junk"]),
+            owned(2, "A", Gender::Male, &["lucky"]),
+            owned(3, "B", Gender::Female, &[]),
+        ];
+        let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
+        assert_executable_plan(&db, &owned, &plan.root);
+        assert!(plan.used_owned.contains(&2), "应选择被动池更干净的具体个体");
+        assert!(!plan.used_owned.contains(&1));
+    }
+
+    /// 备选组合不能只看同物种的单一最佳状态，否则会漏掉实际可配的性别。
+    #[test]
+    fn alternatives_consider_all_gendered_states() {
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 200, 2, false),
+                pal("C", 300, 3, false),
+                pal("T", 150, 4, true),
+            ],
+            vec![],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Male, &["lucky"]),
+            owned(2, "A", Gender::Female, &[]),
+            owned(3, "B", Gender::Female, &[]),
+            owned(4, "C", Gender::Male, &[]),
+        ];
+        let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
+        assert!(
+            plan.alternatives["T"]
+                .iter()
+                .any(|alternative| alternative.parents == ("A".to_string(), "B".to_string())),
+            "A 的被动最佳状态为雄性，但 A×B 仍应作为可执行备选列出"
+        );
+    }
+
+    /// 回归：库存中已有某中间物种，不应阻止重新配出带目标被动的该物种。
+    #[test]
+    fn owned_intermediate_does_not_block_better_bred_state() {
+        // A×B→M；M×C→T。库存已有无被动 M，但 lucky 位于 A，必须允许重新配 M。
+        let db = BreedingDB::new(
+            vec![
+                pal("A", 100, 1, false),
+                pal("B", 200, 2, false),
+                pal("M", 150, 3, false),
+                pal("C", 250, 4, false),
+                pal("T", 200, 5, false),
+            ],
+            vec![
+                UniqueCombo {
+                    parent1: "A".into(),
+                    parent2: "B".into(),
+                    child: "M".into(),
+                    female_parent: None,
+                },
+                UniqueCombo {
+                    parent1: "C".into(),
+                    parent2: "M".into(),
+                    child: "T".into(),
+                    female_parent: None,
+                },
+            ],
+        );
+        let owned = vec![
+            owned(1, "A", Gender::Male, &["lucky"]),
+            owned(2, "B", Gender::Female, &[]),
+            owned(3, "M", Gender::Male, &[]),
+            owned(4, "C", Gender::Female, &[]),
+        ];
+        let plan = plan(&db, &owned, "T", &["lucky".to_string()]).unwrap();
+        assert_executable_plan(&db, &owned, &plan.root);
+        assert!(plan.used_owned.contains(&1));
+        assert!(!plan.used_owned.contains(&3));
+        assert_eq!(plan.total_breedings, 2);
     }
 }
