@@ -8,6 +8,7 @@ type BitSet = Box<[u64]>;
 
 #[derive(Clone)]
 struct State {
+    id: u64,
     species: usize,
     mask: u8,
     pool: BitSet,
@@ -68,6 +69,7 @@ struct Solver<'a> {
     pin_bits: HashMap<usize, usize>,
     all_pins: BitSet,
     states: Vec<Vec<Rc<State>>>,
+    next_state_id: u64,
 }
 
 impl<'a> Solver<'a> {
@@ -111,12 +113,15 @@ impl<'a> Solver<'a> {
             pin_bits,
             all_pins,
             states: vec![Vec::new(); db.pals.len()],
+            next_state_id: 0,
         };
         for pal in owned {
             let Some(species) = db.index_of(&pal.species) else {
                 continue;
             };
+            let id = solver.take_state_id();
             let state = Rc::new(State {
+                id,
                 species,
                 mask: solver.mask_of(&pal.passives),
                 pool: solver.pool_of(&pal.passives),
@@ -132,6 +137,12 @@ impl<'a> Solver<'a> {
             solver.insert(state);
         }
         solver
+    }
+
+    fn take_state_id(&mut self) -> u64 {
+        let id = self.next_state_id;
+        self.next_state_id += 1;
+        id
     }
 
     fn mask_of(&self, passives: &[String]) -> u8 {
@@ -158,12 +169,23 @@ impl<'a> Solver<'a> {
     }
 
     fn dominates(a: &State, b: &State) -> bool {
-        (a.mask | b.mask) == a.mask
-            && bit_is_subset(&a.pool, &b.pool)
-            && a.cost <= b.cost
-            && a.depth <= b.depth
-            && (a.can_be(Gender::Male) as u8) >= (b.can_be(Gender::Male) as u8)
-            && (a.can_be(Gender::Female) as u8) >= (b.can_be(Gender::Female) as u8)
+        let gender_superset = (a.can_be(Gender::Male) as u8) >= (b.can_be(Gender::Male) as u8)
+            && (a.can_be(Gender::Female) as u8) >= (b.can_be(Gender::Female) as u8);
+        if !gender_superset {
+            return false;
+        }
+
+        let a_pool = junk_count(a);
+        let b_pool = junk_count(b);
+        if a.mask == b.mask {
+            // This is the same inheritance result, so use the exact ordering
+            // applied to final candidates instead of retaining a Pareto trade-
+            // off that the UI will never select.
+            return (a_pool, a.cost, a.depth, a.source_key())
+                <= (b_pool, b.cost, b.depth, b.source_key());
+        }
+
+        (a.mask | b.mask) == a.mask && a_pool <= b_pool && a.cost <= b.cost && a.depth <= b.depth
     }
 
     fn rank(state: &State) -> (u32, u32, u32, u32, u32, u32, u64) {
@@ -267,30 +289,35 @@ impl<'a> Solver<'a> {
             {
                 continue;
             }
-            let ideal_target_cost = self.states[target]
+            let best_full_target = self.states[target]
                 .iter()
                 .filter(|state| {
                     state.mask.count_ones() as usize == self.desired.len()
-                        && bit_count(&state.pool) as usize == self.desired.len()
                         && !state.is_owned()
                         && self.pins_satisfied(state)
                 })
-                .map(|state| state.cost)
+                .map(|state| (junk_count(state), state.cost, state.depth))
                 .min();
-            // 目标按产品语义必须经至少一次配种获得；cost=1 且全覆盖、无垃圾
+            // 目标按产品语义必须经至少一次配种获得；cost=1 且全覆盖、无杂项
             // 已达到所有排序维度的理论下界，后续状态不可能改善结果。
-            if ideal_target_cost == Some(1) {
+            if best_full_target == Some((0, 1, 1)) {
                 break;
             }
-            // 子代成本严格大于任一亲本。已有“全覆盖且无垃圾被动”的目标后，
-            // 成本不小于它的状态不可能再改善最终排序。
-            if ideal_target_cost.is_some_and(|best| a.cost >= best) {
+            // 杂项被动和成本在配种中只会增加。已有全覆盖目标后，若从当前
+            // 状态出发的理论下界也不优于它，就无需再展开该状态。
+            if best_full_target.is_some_and(|best| {
+                (
+                    junk_count(&a),
+                    a.cost.saturating_add(1),
+                    a.depth.saturating_add(1),
+                ) >= best
+            }) {
                 continue;
             }
             let partners: Vec<Rc<State>> = self
                 .states
                 .iter()
-                .flat_map(|states| states.iter().cloned())
+                .flat_map(|states| states.iter().filter(|state| state.id <= a.id).cloned())
                 .collect();
             for b in partners {
                 // 同一只已持有个体不能和自己配种；配种状态则可以重复生产
@@ -299,7 +326,9 @@ impl<'a> Solver<'a> {
                     continue;
                 }
                 for (child, kind, g1, g2) in self.outcomes(&a, &b) {
+                    let id = self.take_state_id();
                     let state = Rc::new(State {
+                        id,
                         species: child,
                         mask: a.mask | b.mask,
                         pool: bit_union(&a.pool, &b.pool),
@@ -516,10 +545,6 @@ fn bit_union(a: &BitSet, b: &BitSet) -> BitSet {
         .into_boxed_slice()
 }
 
-fn bit_is_subset(a: &BitSet, b: &BitSet) -> bool {
-    a.iter().zip(b.iter()).all(|(a, b)| a & !b == 0)
-}
-
 fn alternative_cmp(a: &Alternative, b: &Alternative) -> Ordering {
     (a.cost, a.depth, std::cmp::Reverse(a.covered), &a.parents).cmp(&(
         b.cost,
@@ -529,12 +554,16 @@ fn alternative_cmp(a: &Alternative, b: &Alternative) -> Ordering {
     ))
 }
 
+fn junk_count(state: &State) -> u32 {
+    bit_count(&state.pool).saturating_sub(state.mask.count_ones())
+}
+
 fn candidate_rank(state: &State, desired_count: usize) -> (u8, u32, u32, u32, u32, u64) {
     let full = state.mask.count_ones() as usize == desired_count;
     (
         !full as u8,
         u8::MAX as u32 - state.mask.count_ones(),
-        bit_count(&state.pool),
+        junk_count(state),
         state.cost,
         state.depth,
         state.source_key(),
@@ -552,11 +581,9 @@ pub(super) fn solve(
         return Err(PlanError::UnknownSpecies(target.to_string()));
     };
     let mut solver = Solver::new(db, owned, desired_passives, pins);
-    solver.expand(target_idx);
     let desired_count = solver.desired.len();
-    let target_states = &solver.states[target_idx];
     if pins.is_empty() {
-        if let Some(best_owned) = target_states
+        if let Some(best_owned) = solver.states[target_idx]
             .iter()
             .filter(|state| state.is_owned() && state.mask.count_ones() as usize == desired_count)
             .min_by_key(|state| candidate_rank(state, desired_count))
@@ -565,6 +592,8 @@ pub(super) fn solve(
             return Ok(solver.into_plan(best_owned));
         }
     }
+    solver.expand(target_idx);
+    let target_states = &solver.states[target_idx];
     let compliant: Vec<_> = target_states
         .iter()
         .filter(|state| {

@@ -75,7 +75,7 @@ fn op(id: u64, species: &str, gender: Gender) -> OwnedPal {
         nickname: None,
         is_lucky: false,
         basecamp: None,
-            synced: false,
+        synced: false,
     }
 }
 
@@ -142,13 +142,47 @@ fn planner_handles_full_roster() {
         })
         .collect();
     let target = &db.pals[db.pals.len() / 2].internal_name;
-    let plan = planner::plan(
-        &db,
-        &owned,
-        target,
-        &["PAL_CorporateSlave".to_string()],
-    )
-    .expect("完整库存应能规划目标");
+    let plan = planner::plan(&db, &owned, target, &["PAL_CorporateSlave".to_string()])
+        .expect("完整库存应能规划目标");
+    assert!(!plan.used_owned.is_empty());
+}
+
+/// Real inventory regression: repeated species with varied passive pools must
+/// remain interactive instead of causing an unbounded Pareto frontier.
+#[test]
+fn planner_handles_486_varied_individuals() {
+    let db = load_db();
+    let owned: Vec<OwnedPal> = (0..486)
+        .map(|i| {
+            let pal = &db.pals[i % db.pals.len()];
+            OwnedPal {
+                id: i as u64 + 1,
+                species: pal.internal_name.clone(),
+                gender: if i % 2 == 0 {
+                    Gender::Male
+                } else {
+                    Gender::Female
+                },
+                passives: vec![
+                    format!("inventory-passive-{}", i % 37),
+                    format!("secondary-passive-{}", i % 19),
+                ],
+                group: PalGroup::Box,
+                is_boss: false,
+                favorite: 0,
+                nickname: None,
+                is_lucky: false,
+                basecamp: None,
+                synced: false,
+            }
+        })
+        .collect();
+
+    let desired = (0..4)
+        .map(|i| format!("inventory-passive-{i}"))
+        .collect::<Vec<_>>();
+    let plan = planner::plan(&db, &owned, "CandleGhost", &desired)
+        .expect("486-individual inventory should still produce a plan");
     assert!(!plan.used_owned.is_empty());
 }
 
