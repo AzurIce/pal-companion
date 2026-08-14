@@ -24,14 +24,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Cargo parses every workspace member before selecting -p palws. The web
-      # package has this sibling path dependency, so reproduce the local layout.
-      - name: Checkout pinned dioxus-flow dependency
-        shell: pwsh
-        run: |
-          git clone --filter=blob:none https://github.com/AzurIce/dioxus-flow.git ..\dioxus-flow
-          git -C ..\dioxus-flow checkout 157de4f8ca4387dd5d406ff48050723f5249bc2d
-
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust build

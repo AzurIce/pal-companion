@@ -12,7 +12,9 @@ gen-data = ["dep:ureq"]
 
 [dependencies]
 dioxus = { version = "0.7", features = ["web", "router"] }
-dioxus-flow = { path = "../dioxus-flow" }
+# 上游 dioxus-flow（含 RenderNode 改动，commit 7499541）。
+# 本地快速调试可临时改为 path = "../dioxus-flow"，push 前必须切回 git 依赖（见 AGENTS.md）。
+dioxus-flow = { git = "https://github.com/AzurIce/dioxus-flow", rev = "7499541bfd61f7ad2043359338ae9e1e923caa76" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gloo-storage = "0.3"
